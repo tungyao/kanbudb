@@ -23,5 +23,6 @@ int           wal_replay(kanbudb_wal_t* wal,
                                          void* ctx),
                          void* ctx);
 uint64_t      wal_last_seq(kanbudb_wal_t* wal);
+int           wal_truncate(kanbudb_wal_t* wal);
 
 #endif

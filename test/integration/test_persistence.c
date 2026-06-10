@@ -22,13 +22,27 @@ static void cleanup_files(void) {
     char p[512];
     snprintf(p, sizeof(p), "%s.wal", TEST_DB);
     unlink(p);
+    snprintf(p, sizeof(p), "%s.system", TEST_DB);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s.seq", TEST_DB);
+    unlink(p);
     for (int i = 0; i < 100; i++) {
         snprintf(p, sizeof(p), "%s.sst.0.%d", TEST_DB, i);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s.sst.1.%d", TEST_DB, i);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s.ckpt.%d", TEST_DB, i);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s.ckpt.%d.tmp", TEST_DB, i);
         unlink(p);
     }
 }
 
-/* ── Test 1: Basic WAL recovery ──────────────────────────── */
+/* ── Test 1: Basic WAL recovery ────────────────────────────
+ *
+ * Schema is now persisted via .system SSTable.
+ * On reopen, the table is automatically restored —
+ * no need to call db_create_table again. */
 
 static int test_wal_recovery(void) {
     cleanup_files();
@@ -56,13 +70,12 @@ static int test_wal_recovery(void) {
 
     db_close(db);
 
-    /* Reopen — should replay WAL into LSM */
+    /* Reopen — schema auto-restored from .system, data from SSTable+WAL */
     db = NULL;
     rc = db_open(TEST_DB, &config, &db);
     if (rc != KANBUDB_OK || !db) return 0;
 
-    rc = db_create_table(db, "users", col_names, col_types, 2, "id");
-    if (rc != KANBUDB_OK) { db_close(db); return 0; }
+    /* Table "users" is auto-loaded from .system — don't recreate */
 
     void* val = NULL;
     size_t vlen = 0;
@@ -71,7 +84,6 @@ static int test_wal_recovery(void) {
     if (rc != KANBUDB_OK || !val || vlen != 6 || memcmp(val, "Alice", 6) != 0) {
         db_close(db); return 0;
     }
-    /* DO NOT free(val) — it's internal LSM memory */
 
     vlen = 0;
     rc = db_get(db, "users", "user_2", 7, &val, &vlen);
@@ -89,7 +101,6 @@ static int test_wal_recovery(void) {
 static int test_flush_recovery(void) {
     cleanup_files();
 
-    /* Small memtable → triggers auto-flush to SSTable */
     db_config_t config;
     config.fsync_mode = KANBUDB_FSYNC_NONE;
     config.cache_size = 65536;
@@ -118,13 +129,10 @@ static int test_flush_recovery(void) {
 
     db_close(db);
 
-    /* Reopen — load SSTables into B-tree + replay WAL into LSM */
+    /* Reopen — schema auto-restored, data from SSTable+WAL */
     db = NULL;
     rc = db_open(TEST_DB, &config, &db);
     if (rc != KANBUDB_OK || !db) return 0;
-
-    rc = db_create_table(db, "items", col_names, col_types, 2, "id");
-    if (rc != KANBUDB_OK) { db_close(db); return 0; }
 
     for (int i = 0; i < n; i++) {
         void* val = NULL;
@@ -166,16 +174,13 @@ static int test_delete_recovery(void) {
 
     /* Reopen */
     db_open(TEST_DB, &config, &db);
-    db_create_table(db, "t", col_names, col_types, 1, "id");
 
     void* val = NULL;
     size_t vlen = 0;
 
-    /* x should still be there */
     int rc = db_get(db, "t", "x", 2, &val, &vlen);
     if (rc != KANBUDB_OK) { db_close(db); return 0; }
 
-    /* y should be gone (WAL replays DELETE → tombstone in LSM) */
     rc = db_get(db, "t", "y", 2, &val, &vlen);
     if (rc != KANBUDB_ERR_NOTFOUND) { db_close(db); return 0; }
 
@@ -206,25 +211,28 @@ static int test_multi_cycle(void) {
     db_put(db, "t", "k3", 3, "v3", 3);
     db_close(db);
 
-    /* Cycle 2: verify, add more */
+    /* Cycle 2: verify, add more (schema auto-restored, don't recreate) */
     db_open(TEST_DB, &config, &db);
-    db_create_table(db, "t", col_names, col_types, 1, "id");
 
     void* val = NULL; size_t vlen = 0;
-    if (db_get(db, "t", "k1", 3, &val, &vlen) != KANBUDB_OK) { db_close(db); return 0; }
+    int rc2 = db_get(db, "t", "k1", 3, &val, &vlen);
+    if (rc2 != KANBUDB_OK) { fprintf(stderr,"  C2:k1 rc=%d\n",rc2); db_close(db); return 0; }
     db_put(db, "t", "k4", 3, "v4", 3);
     db_delete(db, "t", "k2", 3);
     db_close(db);
 
     /* Cycle 3: final verify */
     db_open(TEST_DB, &config, &db);
-    db_create_table(db, "t", col_names, col_types, 1, "id");
 
-    if (db_get(db, "t", "k1", 3, &val, &vlen) != KANBUDB_OK) { db_close(db); return 0; }
-    /* k2 was deleted */
-    if (db_get(db, "t", "k2", 3, &val, &vlen) != KANBUDB_ERR_NOTFOUND) { db_close(db); return 0; }
-    if (db_get(db, "t", "k3", 3, &val, &vlen) != KANBUDB_OK) { db_close(db); return 0; }
-    if (db_get(db, "t", "k4", 3, &val, &vlen) != KANBUDB_OK) { db_close(db); return 0; }
+    int rc;
+    rc = db_get(db, "t", "k1", 3, &val, &vlen);
+    if (rc != KANBUDB_OK) { fprintf(stderr,"  C3:k1 rc=%d\n",rc); db_close(db); return 0; }
+    rc = db_get(db, "t", "k2", 3, &val, &vlen);
+    if (rc != KANBUDB_ERR_NOTFOUND) { fprintf(stderr,"  C3:k2 rc=%d (want NOTFOUND)\n",rc); db_close(db); return 0; }
+    rc = db_get(db, "t", "k3", 3, &val, &vlen);
+    if (rc != KANBUDB_OK) { fprintf(stderr,"  C3:k3 rc=%d\n",rc); db_close(db); return 0; }
+    rc = db_get(db, "t", "k4", 3, &val, &vlen);
+    if (rc != KANBUDB_OK) { fprintf(stderr,"  C3:k4 rc=%d\n",rc); db_close(db); return 0; }
 
     db_close(db);
     cleanup_files();

@@ -21,6 +21,14 @@ static void cleanup(void) {
   unlink(path);
   snprintf(path, sizeof(path), "%s.lsm", TEST_DB_PATH);
   unlink(path);
+  snprintf(path, sizeof(path), "%s.system", TEST_DB_PATH);
+  unlink(path);
+  for (int i = 0; i < 10; i++) {
+    snprintf(path, sizeof(path), "%s.sst.0.%d", TEST_DB_PATH, i);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s.ckpt.%d", TEST_DB_PATH, i);
+    unlink(path);
+  }
 }
 
 static int test_lifecycle(void) {

@@ -334,6 +334,10 @@ int lsm_is_full(kanbudb_lsm_t* lsm) {
   return lsm ? memtable_is_full(lsm->active) : 0;
 }
 
+int lsm_has_data(kanbudb_lsm_t* lsm) {
+  return lsm ? (memtable_size(lsm->active) > 0) : 0;
+}
+
 uint64_t lsm_next_seq(kanbudb_lsm_t* lsm) {
   if (!lsm) return 0;
   return lsm->next_seq++;

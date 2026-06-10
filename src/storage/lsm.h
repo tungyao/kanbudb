@@ -45,6 +45,7 @@ int           lsm_delete(kanbudb_lsm_t* lsm, uint64_t table_id,
                          const void* key, size_t key_len);
 int           lsm_flush(kanbudb_lsm_t* lsm);
 int           lsm_is_full(kanbudb_lsm_t* lsm);
+int           lsm_has_data(kanbudb_lsm_t* lsm);
 uint64_t      lsm_next_seq(kanbudb_lsm_t* lsm);
 
 /* Iterate the flushing memtable (after lsm_flush but before it's consumed).

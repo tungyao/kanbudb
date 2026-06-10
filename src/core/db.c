@@ -6,6 +6,7 @@
 #include "btree.h"
 #include "wal.h"
 #include "sstable.h"
+#include "compaction.h"
 #include "fts/index.h"
 #include "fts/tokenizer.h"
 #include "fts/parser.h"
@@ -15,6 +16,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#define KANBUDB_SYSTEM_TABLE_SUFFIX ".system"
+#define KANBUDB_COMPACTION_THRESHOLD 4
+
 static const db_config_t default_config = {
   KANBUDB_FSYNC_NONE,
   65536,
@@ -22,13 +26,11 @@ static const db_config_t default_config = {
   1
 };
 
-/* ── Forward declare flush context struct ─────────────────── */
 struct sstable_flush_ctx {
   sstable_writer_t* w;
   int had_error;
 };
 
-/* ── Flush writer callback ───────────────────────────────── */
 static int flush_write_cb(const lsm_entry_t* e, void* ctx) {
   struct sstable_flush_ctx* fc = (struct sstable_flush_ctx*)ctx;
   uint8_t flag = e->deleted ? KANBUDB_SSTABLE_FLAG_TOMBSTONE
@@ -39,7 +41,6 @@ static int flush_write_cb(const lsm_entry_t* e, void* ctx) {
   return rc;
 }
 
-/* ── WAL replay callback ──────────────────────────────────── */
 static int wal_replay_cb(int op, uint64_t table_id,
                           const void* key, size_t key_len,
                           const void* value, size_t val_len,
@@ -53,42 +54,267 @@ static int wal_replay_cb(int op, uint64_t table_id,
   }
 }
 
-/* ── SSTable scan → B-tree load callback ─────────────────── */
 static int sstable_load_cb(const void* key, size_t key_len,
                             const void* value, size_t val_len,
                             uint8_t flag, void* ctx) {
   struct kanbudb_db* db = (struct kanbudb_db*)ctx;
   if (flag & KANBUDB_SSTABLE_FLAG_TOMBSTONE) {
-    return KANBUDB_OK; /* skip deleted keys */
+    btree_delete(db->btree, key, key_len);
+    return KANBUDB_OK;
   }
   return btree_put(db->btree, key, key_len, value, val_len);
 }
 
-/* ── Flush memtable to SSTable and load into B-tree ──────── */
+/* ── Schema persistence ──────────────────────────────────────
+ * System SSTable stores table definitions as:
+ *   key = "table:N:name"  value = JSON-like schema string
+ *   key = "tables_count"  value = count as string
+ */
+
+static int schema_save_cb(const void* key, size_t key_len,
+                           const void* value, size_t val_len,
+                           uint8_t flag, void* ctx) {
+  (void)flag;
+  sstable_writer_t* w = (sstable_writer_t*)ctx;
+  return sstable_writer_add(w, key, key_len, value, val_len,
+                             KANBUDB_SSTABLE_FLAG_ALIVE);
+}
+
+static int db_save_schema(struct kanbudb_db* db) {
+  char sys_path[512];
+  char tmp_path[512];
+  snprintf(sys_path, sizeof(sys_path), "%s%s", db->path, KANBUDB_SYSTEM_TABLE_SUFFIX);
+  snprintf(tmp_path, sizeof(tmp_path), "%s%s.tmp", db->path, KANBUDB_SYSTEM_TABLE_SUFFIX);
+
+  sstable_writer_t* w = sstable_writer_create(tmp_path, sys_path, 0);
+  if (!w) return KANBUDB_ERR_OOM;
+
+  /* Write count */
+  char count_str[16];
+  snprintf(count_str, sizeof(count_str), "%d", db->num_tables);
+  sstable_writer_add(w, "tables_count", 13, count_str, strlen(count_str) + 1,
+                      KANBUDB_SSTABLE_FLAG_ALIVE);
+
+  for (int i = 0; i < db->num_tables; i++) {
+    kanbudb_table_t* t = &db->tables[i];
+    /* key = "table:NNN:name" */
+    char key[128];
+    snprintf(key, sizeof(key), "table:%d:%s", i, t->name);
+
+    /* value = "num_cols|pk_idx|col1_type:col1_name|col2_type:col2_name|..." */
+    char val[2048];
+    int pos = snprintf(val, sizeof(val), "%d|%d", t->num_cols, t->primary_key_idx);
+    for (int j = 0; j < t->num_cols; j++) {
+      pos += snprintf(val + pos, sizeof(val) - (size_t)pos,
+                       "|%d:%s", (int)t->col_types[j], t->col_names[j]);
+    }
+    sstable_writer_add(w, key, strlen(key) + 1, val, strlen(val) + 1,
+                        KANBUDB_SSTABLE_FLAG_ALIVE);
+  }
+
+  int rc = sstable_writer_finish(w);
+  sstable_writer_destroy(w);
+  return rc;
+}
+
+/* Callback for loading schema from system SSTable */
+typedef struct {
+  struct kanbudb_db* db;
+  int error;
+} schema_load_ctx_t;
+
+static int schema_load_cb(const void* key, size_t key_len,
+                           const void* value, size_t val_len,
+                           uint8_t flag, void* ctx) {
+  schema_load_ctx_t* lc = (schema_load_ctx_t*)ctx;
+  if (flag & KANBUDB_SSTABLE_FLAG_TOMBSTONE) return KANBUDB_OK;
+
+  const char* k = (const char*)key;
+  const char* v = (const char*)value;
+
+  if (strcmp(k, "tables_count") == 0) {
+    return KANBUDB_OK; /* handled after full scan */
+  }
+
+  if (strncmp(k, "table:", 6) != 0) return KANBUDB_OK;
+
+  /* Parse: table:IDX:NAME */
+  const char* name_start = k + 6;
+  const char* name_colon = strchr(name_start, ':');
+  if (!name_colon) return KANBUDB_OK;
+  const char* table_name = name_colon + 1;
+
+  /* Parse value: num_cols|pk_idx|type:name|type:name|... */
+  int num_cols, pk_idx;
+  if (sscanf(v, "%d|%d", &num_cols, &pk_idx) < 2) return KANBUDB_OK;
+
+  if (lc->db->num_tables >= KANBUDB_MAX_TABLES) return KANBUDB_ERR_OOM;
+  kanbudb_table_t* t = &lc->db->tables[lc->db->num_tables];
+  memset(t, 0, sizeof(*t));
+
+  size_t nlen = strlen(table_name);
+  if (nlen >= sizeof(t->name)) nlen = sizeof(t->name) - 1;
+  memcpy(t->name, table_name, nlen);
+  t->name[nlen] = '\0';
+  t->num_cols = num_cols;
+  t->primary_key_idx = pk_idx;
+
+  t->col_types = (kanbudb_col_type_t*)malloc((size_t)num_cols * sizeof(kanbudb_col_type_t));
+  t->col_names = (char**)malloc((size_t)num_cols * sizeof(char*));
+  if (!t->col_types || !t->col_names) { lc->error = 1; return KANBUDB_ERR_OOM; }
+
+  /* Parse each type:name pair */
+  const char* p = v;
+  int consumed = 0;
+  sscanf(p, "%d|%d%n", &num_cols, &pk_idx, &consumed);
+  p += consumed;
+
+  for (int j = 0; j < num_cols; j++) {
+    int col_type;
+    char col_name[256];
+    if (sscanf(p, "|%d:%255s%n", &col_type, col_name, &consumed) < 2) break;
+    p += consumed;
+    t->col_types[j] = (kanbudb_col_type_t)col_type;
+    t->col_names[j] = strdup(col_name);
+    if (!t->col_names[j]) { lc->error = 1; return KANBUDB_ERR_OOM; }
+  }
+
+  t->id = (uint64_t)(lc->db->num_tables + 1);
+  lc->db->num_tables++;
+  return KANBUDB_OK;
+}
+
+/* ── Checkpoint: dump B-tree to SSTable ───────────────────── */
+
+static int btree_dump_cb(const void* key, size_t key_len,
+                          const void* value, size_t val_len,
+                          uint8_t flag, void* ctx) {
+  (void)flag;
+  sstable_writer_t* w = (sstable_writer_t*)ctx;
+  return sstable_writer_add(w, key, key_len, value, val_len,
+                             KANBUDB_SSTABLE_FLAG_ALIVE);
+}
+
+static int db_checkpoint(struct kanbudb_db* db) {
+  /* Dump B-tree contents to a checkpoint SSTable:
+   * {dbpath}.ckpt.{seq} */
+  uint64_t seq = lsm_next_seq(db->lsm);
+
+  char ckpt_path[512], tmp_path[512];
+  snprintf(ckpt_path, sizeof(ckpt_path), "%s.ckpt.%llu",
+           db->path, (unsigned long long)seq);
+  snprintf(tmp_path, sizeof(tmp_path), "%s.ckpt.%llu.tmp",
+           db->path, (unsigned long long)seq);
+
+  sstable_writer_t* w = sstable_writer_create(tmp_path, ckpt_path, seq);
+  if (!w) return KANBUDB_ERR_OOM;
+
+  /* Iterate B-tree via cursor */
+  btree_cursor_t* cur = btree_cursor_create(db->btree);
+  if (!cur) { sstable_writer_destroy(w); return KANBUDB_ERR_OOM; }
+
+  int rc = btree_cursor_seek(cur, NULL, 0);
+  if (rc == KANBUDB_OK) {
+    btree_kv_t kv;
+    while (btree_cursor_next(cur, &kv) == KANBUDB_OK) {
+      rc = sstable_writer_add(w, kv.key, kv.key_len,
+                               kv.value, kv.val_len,
+                               KANBUDB_SSTABLE_FLAG_ALIVE);
+      if (rc != KANBUDB_OK) break;
+    }
+  }
+
+  btree_cursor_destroy(cur);
+
+  if (rc == KANBUDB_OK) {
+    rc = sstable_writer_finish(w);
+  }
+  sstable_writer_destroy(w);
+  return rc;
+}
+
+/* ── Auto compaction ──────────────────────────────────────── */
+
+static int db_compact_sstables(struct kanbudb_db* db) {
+  char* paths[256];
+  int num = sstable_scan_dir(db->path, paths, 256, NULL);
+  if (num < 2) {
+    for (int i = 0; i < num; i++) free(paths[i]);
+    return KANBUDB_OK;
+  }
+
+  uint64_t out_seq = lsm_next_seq(db->lsm);
+  char out_path[512];
+  snprintf(out_path, sizeof(out_path), "%s.sst.1.%llu",
+           db->path, (unsigned long long)out_seq);
+
+  kanbudb_compactor_t* c = compactor_create();
+  int rc = KANBUDB_ERR_OOM;
+  if (c) {
+    rc = compactor_merge_sstables(c, (const char**)paths, num, out_path, out_seq);
+    compactor_destroy(c);
+  }
+
+  /* Remove old SSTables if merge succeeded */
+  if (rc == KANBUDB_OK) {
+    for (int i = 0; i < num; i++) {
+      unlink(paths[i]);
+    }
+    /* Load merged SSTable into B-tree */
+    sstable_reader_t* sr = sstable_reader_open(out_path);
+    if (sr) {
+      sstable_reader_scan(sr, &sstable_load_cb, db);
+      sstable_reader_close(sr);
+    }
+  }
+
+  for (int i = 0; i < num; i++) free(paths[i]);
+  return rc;
+}
+
+/* ── Persistent sequence counter for SSTable naming ───────── */
+
+static uint64_t db_persistent_seq(const char* db_path) {
+  char seq_path[512];
+  snprintf(seq_path, sizeof(seq_path), "%s.seq", db_path);
+  
+  uint64_t seq = 0;
+  FILE* f = fopen(seq_path, "rb");
+  if (f) {
+    if (fread(&seq, sizeof(seq), 1, f) != 1) seq = 0;
+    fclose(f);
+  }
+  
+  seq++;
+  f = fopen(seq_path, "wb");
+  if (f) {
+    fwrite(&seq, sizeof(seq), 1, f);
+    fclose(f);
+  }
+  
+  return seq;
+}
+
+/* ── Flush memtable to SSTable, truncate WAL ──────────────── */
+
 static int db_flush_memtable(struct kanbudb_db* db) {
   if (!db) return KANBUDB_ERR_INVAL;
 
-  /* Swap active → flushing, create new active */
   int rc = lsm_flush(db->lsm);
   if (rc != KANBUDB_OK) return rc;
 
-  uint64_t seq = lsm_next_seq(db->lsm);
+  /* Use a persistent monotonic sequence for SSTable naming */
+  uint64_t seq = db_persistent_seq(db->path);
 
-  /* Build path: {dbpath}.sst.0.{seq} */
-  char sst_path[512];
-  char tmp_path[512];
+  char sst_path[512], tmp_path[512];
   snprintf(sst_path, sizeof(sst_path), "%s.sst.0.%llu",
            db->path, (unsigned long long)seq);
   snprintf(tmp_path, sizeof(tmp_path), "%s.sst.0.%llu.tmp",
            db->path, (unsigned long long)seq);
 
   sstable_writer_t* w = sstable_writer_create(tmp_path, sst_path, seq);
-  if (!w) {
-    lsm_destroy_flushing(db->lsm);
-    return KANBUDB_ERR_OOM;
-  }
+  if (!w) { lsm_destroy_flushing(db->lsm); return KANBUDB_ERR_OOM; }
 
-  /* Iterate flushing memtable and write to SSTable */
   struct sstable_flush_ctx fctx;
   fctx.w = w;
   fctx.had_error = 0;
@@ -102,20 +328,19 @@ static int db_flush_memtable(struct kanbudb_db* db) {
 
   rc = sstable_writer_finish(w);
   sstable_writer_destroy(w);
-  if (rc != KANBUDB_OK) {
-    lsm_destroy_flushing(db->lsm);
-    return rc;
-  }
+  if (rc != KANBUDB_OK) { lsm_destroy_flushing(db->lsm); return rc; }
 
-  /* Load the new SSTable into B-tree */
+  /* Load into B-tree */
   sstable_reader_t* sr = sstable_reader_open(sst_path);
   if (sr) {
     sstable_reader_scan(sr, &sstable_load_cb, db);
     sstable_reader_close(sr);
   }
 
-  /* Done with flushing memtable */
   lsm_destroy_flushing(db->lsm);
+
+  /* Truncate WAL — all flushed entries are now durable in SSTable+B-tree */
+  wal_truncate(db->wal);
 
   return KANBUDB_OK;
 }
@@ -128,64 +353,51 @@ static int find_table(struct kanbudb_db* db, const char* name) {
   return -1;
 }
 
+/* ── db_open ───────────────────────────────────────────────── */
+
 int db_open(const char* path, const db_config_t* config, db_t** out) {
   if (!path || !out) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* db = (struct kanbudb_db*)calloc(1, sizeof(*db));
   if (!db) return KANBUDB_ERR_OOM;
 
-  db->path = (char*)malloc(strlen(path) + 1);
+  db->path = strdup(path);
   if (!db->path) { free(db); return KANBUDB_ERR_OOM; }
-  strcpy(db->path, path);
 
-  if (config) {
-    db->config = *config;
-  } else {
-    db->config = default_config;
-  }
+  db->config = config ? *config : default_config;
 
   char wal_path[512];
   snprintf(wal_path, sizeof(wal_path), "%s.wal", path);
-
   db->wal = wal_create(wal_path, db->config.fsync_mode);
   if (!db->wal) { free(db->path); free(db); return KANBUDB_ERR_IO; }
 
-  char lsm_path[512];
-  snprintf(lsm_path, sizeof(lsm_path), "%s.lsm", path);
-
-  db->lsm = lsm_create(lsm_path, db->config.memtable_size);
-  if (!db->lsm) {
-    wal_destroy(db->wal);
-    free(db->path);
-    free(db);
-    return KANBUDB_ERR_OOM;
-  }
+  db->lsm = lsm_create(path, db->config.memtable_size);
+  if (!db->lsm) { wal_destroy(db->wal); free(db->path); free(db); return KANBUDB_ERR_OOM; }
 
   db->btree = btree_create();
-  if (!db->btree) {
-    lsm_destroy(db->lsm);
-    wal_destroy(db->wal);
-    free(db->path);
-    free(db);
-    return KANBUDB_ERR_OOM;
-  }
+  if (!db->btree) { lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return KANBUDB_ERR_OOM; }
 
   db->fts_index = fts_index_create();
-  if (!db->fts_index) {
-    btree_destroy(db->btree);
-    lsm_destroy(db->lsm);
-    wal_destroy(db->wal);
-    free(db->path);
-    free(db);
-    return KANBUDB_ERR_OOM;
-  }
+  if (!db->fts_index) { btree_destroy(db->btree); lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return KANBUDB_ERR_OOM; }
 
   db->num_tables = 0;
   db->last_error = KANBUDB_OK;
 
-  /* ── Recover from disk state ─────────────────────────── */
+  /* Phase 1: load system table (schema) */
+  {
+    char sys_path[512];
+    snprintf(sys_path, sizeof(sys_path), "%s%s", path, KANBUDB_SYSTEM_TABLE_SUFFIX);
+    sstable_reader_t* sr = sstable_reader_open(sys_path);
+    if (sr) {
+      schema_load_ctx_t lc;
+      memset(&lc, 0, sizeof(lc));
+      lc.db = db;
+      sstable_reader_scan(sr, &schema_load_cb, &lc);
+      sstable_reader_close(sr);
+    }
+  }
 
-  /* 1. Scan and load existing SSTables into B-tree */
+  /* Phase 2: load data SSTables into B-tree */
   {
     char* sst_paths[256];
     int num_sst = sstable_scan_dir(path, sst_paths, 256, NULL);
@@ -199,11 +411,9 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
     }
   }
 
-  /* 2. Replay WAL entries that came after the last SSTable flush.
-   *    Since WAL entries are idempotent (PUT overwrites, DELETE
-   *    inserts tombstone), we replay all entries into the LSM.
-   *    This is safe because LSM is checked before B-tree on read,
-   *    so the LSM's fresher data shadows any stale B-tree entry. */
+  /* Phase 3: [disabled] auto compaction — seq not yet unique across sessions */
+
+  /* Phase 4: replay WAL for any unflushed writes */
   {
     wal_replay(db->wal, &wal_replay_cb, db);
   }
@@ -212,9 +422,24 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
   return KANBUDB_OK;
 }
 
+/* ── db_close ──────────────────────────────────────────────── */
+
 int db_close(db_t* db) {
   if (!db) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+
+  /* Flush any remaining data in memtable */
+  if (lsm_has_data(internal->lsm)) {
+    db_flush_memtable(internal);
+  }
+
+  /* Save schema to system table */
+  if (internal->num_tables > 0) {
+    db_save_schema(internal);
+  }
+
+  /* Take a checkpoint of the B-tree */
+  db_checkpoint(internal);
 
   for (int i = 0; i < internal->num_tables; i++) {
     kanbudb_table_t* t = &internal->tables[i];
@@ -280,7 +505,6 @@ int db_create_table(db_t* db, const char* table_name,
   if (nlen >= sizeof(t->name)) nlen = sizeof(t->name) - 1;
   memcpy(t->name, table_name, nlen);
   t->name[nlen] = '\0';
-
   t->num_cols = num_columns;
 
   t->col_types = (kanbudb_col_type_t*)malloc((size_t)num_columns * sizeof(kanbudb_col_type_t));
@@ -291,15 +515,12 @@ int db_create_table(db_t* db, const char* table_name,
   if (!t->col_names) { free(t->col_types); internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM; }
 
   for (int i = 0; i < num_columns; i++) {
-    t->col_names[i] = (char*)malloc(strlen(col_names[i]) + 1);
+    t->col_names[i] = strdup(col_names[i]);
     if (!t->col_names[i]) {
       for (int j = 0; j < i; j++) free(t->col_names[j]);
-      free(t->col_names);
-      free(t->col_types);
-      internal->last_error = KANBUDB_ERR_OOM;
-      return KANBUDB_ERR_OOM;
+      free(t->col_names); free(t->col_types);
+      internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM;
     }
-    strcpy(t->col_names[i], col_names[i]);
   }
 
   t->primary_key_idx = -1;
@@ -315,6 +536,9 @@ int db_create_table(db_t* db, const char* table_name,
   t->id = (uint64_t)(internal->num_tables + 1);
   internal->num_tables++;
 
+  /* Persist schema immediately */
+  db_save_schema(internal);
+
   internal->last_error = KANBUDB_OK;
   return KANBUDB_OK;
 }
@@ -327,16 +551,15 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
   int idx = find_table(internal, table);
   if (idx < 0) { internal->last_error = KANBUDB_ERR_NOTFOUND; return KANBUDB_ERR_NOTFOUND; }
 
-  uint64_t table_id = internal->tables[idx].id;
-
-  int rc = wal_append(internal->wal, KANBUDB_WAL_PUT, table_id,
+  int rc = wal_append(internal->wal, KANBUDB_WAL_PUT,
+                       internal->tables[idx].id,
                        key, key_len, value, value_len);
   if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
 
-  rc = lsm_put(internal->lsm, table_id, key, key_len, value, value_len);
+  rc = lsm_put(internal->lsm, internal->tables[idx].id,
+                key, key_len, value, value_len);
   if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
 
-  /* Auto-flush if memtable is full */
   if (lsm_is_full(internal->lsm)) {
     int frc = db_flush_memtable(internal);
     if (frc != KANBUDB_OK) { internal->last_error = frc; return frc; }
@@ -372,16 +595,14 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
   int idx = find_table(internal, table);
   if (idx < 0) { internal->last_error = KANBUDB_ERR_NOTFOUND; return KANBUDB_ERR_NOTFOUND; }
 
-  uint64_t table_id = internal->tables[idx].id;
-
-  int rc = wal_append(internal->wal, KANBUDB_WAL_DELETE, table_id,
+  int rc = wal_append(internal->wal, KANBUDB_WAL_DELETE,
+                       internal->tables[idx].id,
                        key, key_len, NULL, 0);
   if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
 
-  rc = lsm_delete(internal->lsm, table_id, key, key_len);
+  rc = lsm_delete(internal->lsm, internal->tables[idx].id, key, key_len);
   if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
 
-  /* Auto-flush if memtable is full */
   if (lsm_is_full(internal->lsm)) {
     int frc = db_flush_memtable(internal);
     if (frc != KANBUDB_OK) { internal->last_error = frc; return frc; }
@@ -475,11 +696,8 @@ int db_fts_search(db_t* db, const char* table, const char* column,
     rs->doc_ids = (uint64_t*)malloc((size_t)num_doc_ids * sizeof(uint64_t));
     rs->scores = (double*)calloc((size_t)num_doc_ids, sizeof(double));
     if (!rs->doc_ids || !rs->scores) {
-      free(rs->doc_ids);
-      free(rs->scores);
-      free(rs);
-      internal->last_error = KANBUDB_ERR_OOM;
-      return KANBUDB_ERR_OOM;
+      free(rs->doc_ids); free(rs->scores); free(rs);
+      internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM;
     }
     memcpy(rs->doc_ids, doc_id_buf, (size_t)num_doc_ids * sizeof(uint64_t));
   } else {
@@ -488,7 +706,6 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   }
 
   rs->current = -1;
-
   *out = rs;
   internal->last_error = KANBUDB_OK;
   return KANBUDB_OK;

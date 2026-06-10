@@ -185,3 +185,30 @@ int wal_replay(kanbudb_wal_t* wal,
 uint64_t wal_last_seq(kanbudb_wal_t* wal) {
   return wal->seq;
 }
+
+int wal_truncate(kanbudb_wal_t* wal) {
+  if (!wal || !wal->file) return KANBUDB_ERR_INVAL;
+  
+  /* Close current WAL */
+  fclose(wal->file);
+  
+  /* Reopen with "wb" to truncate */
+  wal->file = fopen(wal->path, "wb");
+  if (!wal->file) return KANBUDB_ERR_IO;
+  
+  /* Write fresh header with current seq */
+  uint64_t magic = KANBUDB_WAL_MAGIC;
+  uint32_t version = KANBUDB_WAL_VERSION;
+  uint64_t seq = wal->seq;
+  
+  if (fwrite(&magic, sizeof(magic), 1, wal->file) != 1 ||
+      fwrite(&version, sizeof(version), 1, wal->file) != 1 ||
+      fwrite(&seq, sizeof(seq), 1, wal->file) != 1) {
+    fclose(wal->file);
+    return KANBUDB_ERR_IO;
+  }
+  
+  fflush(wal->file);
+  wal->periodic_count = 0;
+  return KANBUDB_OK;
+}

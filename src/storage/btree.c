@@ -246,11 +246,44 @@ int btree_get(kanbudb_btree_t* bt, const void* key, size_t key_len,
   return node_search(bt->root, key, key_len, out_value, out_val_len);
 }
 
+/* Recursive deletion helper — deletes key from the subtree rooted at n.
+ * Only deletes from leaf nodes (data-bearing). Internal node keys
+ * (separators) are left untouched — this is a simple embedded DB,
+ * not a production-grade B-tree with full rebalancing. */
+static int node_delete(btree_node_t* n, const void* key, size_t key_len) {
+  if (!n) return KANBUDB_ERR_NOTFOUND;
+
+  if (n->is_leaf) {
+    /* Linear scan to find the key */
+    for (int i = 0; i < n->num_keys; i++) {
+      if (key_cmp(key, key_len, n->keys[i], n->key_lens[i]) == 0) {
+        /* Found — free and shift */
+        free(n->keys[i]);
+        free(n->values[i]);
+        for (int j = i; j < n->num_keys - 1; j++) {
+          n->keys[j]    = n->keys[j + 1];
+          n->key_lens[j]= n->key_lens[j + 1];
+          n->values[j]  = n->values[j + 1];
+          n->val_lens[j]= n->val_lens[j + 1];
+        }
+        n->num_keys--;
+        return KANBUDB_OK;
+      }
+    }
+    return KANBUDB_ERR_NOTFOUND;
+  } else {
+    /* Internal node — recurse into appropriate child */
+    int i = 0;
+    while (i < n->num_keys && key_cmp(key, key_len, n->keys[i], n->key_lens[i]) >= 0) {
+      i++;
+    }
+    return node_delete(n->children[i], key, key_len);
+  }
+}
+
 int btree_delete(kanbudb_btree_t* bt, const void* key, size_t key_len) {
-  (void)bt;
-  (void)key;
-  (void)key_len;
-  return KANBUDB_ERR_NOTFOUND;
+  if (!bt || !key) return KANBUDB_ERR_INVAL;
+  return node_delete(bt->root, key, key_len);
 }
 
 btree_cursor_t* btree_cursor_create(kanbudb_btree_t* bt) {
