@@ -276,6 +276,26 @@ static int lsm_scan_cb(const lsm_entry_t* entry, void* ctx) {
   return 0;
 }
 
+typedef struct {
+  f64  key;
+  int  idx;
+} sort_entry_t;
+
+static int sort_entry_cmp_asc(const void* a, const void* b) {
+  f64 ka = ((const sort_entry_t*)a)->key;
+  f64 kb = ((const sort_entry_t*)b)->key;
+  if (ka < kb) return -1;
+  if (ka > kb) return 1;
+  return 0;
+}
+static int sort_entry_cmp_desc(const void* a, const void* b) {
+  f64 ka = ((const sort_entry_t*)a)->key;
+  f64 kb = ((const sort_entry_t*)b)->key;
+  if (ka > kb) return -1;
+  if (ka < kb) return 1;
+  return 0;
+}
+
 result_set_t* qb_exec(query_builder_t* qb) {
   if (!qb) return NULL;
 
@@ -366,6 +386,205 @@ result_set_t* qb_exec(query_builder_t* qb) {
 
   key_set_destroy(&seen_keys);
 
+  /* ---- Apply sort ---- */
+  if (qb->has_sort && rs->row_count > 1) {
+    int sort_col = -1;
+    for (int i = 0; i < rs->num_cols; i++) {
+      if (strcmp(rs->col_names[i], qb->sort_column) == 0) {
+        sort_col = i;
+        break;
+      }
+    }
+    if (sort_col >= 0) {
+      sort_entry_t* entries = (sort_entry_t*)malloc((size_t)rs->row_count * sizeof(sort_entry_t));
+      if (entries) {
+        row_schema_t sort_schema;
+        row_schema_init(&sort_schema, rs->col_types, rs->num_cols);
+
+        for (int i = 0; i < rs->row_count; i++) {
+          i32 col_len;
+          const void* col_data = row_extract_column(&sort_schema, sort_col,
+                                                      rs->row_data[i], (i32)rs->row_lens[i], &col_len);
+          if (col_data && col_len > 0) {
+            kanbudb_col_type_t st = rs->col_types[sort_col];
+            if (st == KANBUDB_STRING) {
+              char buf[9] = {0};
+              memcpy(buf, col_data, col_len > 8 ? 8 : (i32)col_len);
+              f64 h = 0;
+              for (int j = 0; j < 8 && buf[j]; j++) h = h * 31 + buf[j];
+              entries[i].key = h;
+            } else if (st == KANBUDB_INT32 || st == KANBUDB_INT64 || st == KANBUDB_BOOL) {
+              entries[i].key = (f64)(st == KANBUDB_INT32 ? *(const i32*)col_data :
+                                      st == KANBUDB_INT64 ? (f64)*(const i64*)col_data :
+                                      (f64)*(const u8*)col_data);
+            } else {
+              entries[i].key = st == KANBUDB_FLOAT ? (f64)*(const f32*)col_data : *(const f64*)col_data;
+            }
+          } else {
+            entries[i].key = 0;
+          }
+          entries[i].idx = i;
+        }
+
+        if (qb->sort_ascending) {
+          qsort(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp_asc);
+        } else {
+          qsort(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp_desc);
+        }
+
+        void** sorted_data = (void**)malloc((size_t)rs->row_count * sizeof(void*));
+        size_t* sorted_lens = (size_t*)malloc((size_t)rs->row_count * sizeof(size_t));
+        if (sorted_data && sorted_lens) {
+          for (int i = 0; i < rs->row_count; i++) {
+            sorted_data[i] = rs->row_data[entries[i].idx];
+            sorted_lens[i] = rs->row_lens[entries[i].idx];
+          }
+          free(rs->row_data);
+          free(rs->row_lens);
+          rs->row_data = sorted_data;
+          rs->row_lens = sorted_lens;
+        } else {
+          free(sorted_data);
+          free(sorted_lens);
+        }
+        free(entries);
+      }
+    }
+  }
+
+  /* ---- Apply limit ---- */
+  if (qb->has_limit && qb->limit < rs->row_count) {
+    for (int i = qb->limit; i < rs->row_count; i++) {
+      free(rs->row_data[i]);
+    }
+    rs->row_count = qb->limit;
+  }
+
+  /* ---- Apply join ---- */
+  if (qb->has_join && rs->row_count > 0) {
+    int local_col = -1;
+    for (int i = 0; i < rs->num_cols; i++) {
+      if (strcmp(rs->col_names[i], qb->join_on_local) == 0) {
+        local_col = i;
+        break;
+      }
+    }
+    if (local_col >= 0) {
+      int foreign_table_idx = -1;
+      for (int i = 0; i < internal->num_tables; i++) {
+        if (strcmp(internal->tables[i].name, qb->join_table) == 0) {
+          foreign_table_idx = i;
+          break;
+        }
+      }
+      if (foreign_table_idx >= 0) {
+        kanbudb_table_t* ft = &internal->tables[foreign_table_idx];
+        int foreign_col = -1;
+        for (int i = 0; i < ft->num_cols; i++) {
+          if (strcmp(ft->col_names[i], qb->join_on_foreign) == 0) {
+            foreign_col = i;
+            break;
+          }
+        }
+        if (foreign_col >= 0) {
+          int new_num_cols = rs->num_cols + ft->num_cols;
+          kanbudb_col_type_t new_types[KANBUDB_MAX_COLS];
+          char* new_names[KANBUDB_MAX_COLS];
+          int nidx = 0;
+          for (int i = 0; i < rs->num_cols; i++) {
+            new_types[nidx] = rs->col_types[i];
+            new_names[nidx] = rs->col_names[i];
+            nidx++;
+          }
+          for (int i = 0; i < ft->num_cols; i++) {
+            if (i == foreign_col) continue;
+            new_types[nidx] = ft->col_types[i];
+            new_names[nidx] = ft->col_names[i];
+            nidx++;
+          }
+          new_num_cols = nidx;
+
+          row_schema_t ft_schema;
+          row_schema_init(&ft_schema, ft->col_types, ft->num_cols);
+
+          for (int i = 0; i < rs->row_count; i++) {
+            i32 join_len;
+            const void* join_data = row_extract_column(&row_schema, local_col,
+                                                        rs->row_data[i], (i32)rs->row_lens[i], &join_len);
+            if (!join_data) continue;
+
+            char key_str[256];
+            int key_len = 0;
+            kanbudb_col_type_t ltype = rs->col_types[local_col];
+            if (ltype == KANBUDB_INT32) {
+              key_len = snprintf(key_str, sizeof(key_str), "%d", *(const i32*)join_data);
+            } else if (ltype == KANBUDB_INT64) {
+              key_len = snprintf(key_str, sizeof(key_str), "%lld", (long long)*(const i64*)join_data);
+            } else {
+              memcpy(key_str, join_data, (size_t)join_len);
+              key_len = join_len;
+            }
+            key_str[key_len] = '\0';
+
+            void* fval = NULL;
+            size_t flen = 0;
+            int rc = db_get((db_t*)internal, qb->join_table,
+                             key_str, (size_t)key_len + 1, &fval, &flen);
+            if (rc != KANBUDB_OK || !fval) continue;
+
+            i32 combined_size = (i32)rs->row_lens[i];
+            for (int j = 0; j < ft->num_cols; j++) {
+              if (j == foreign_col) continue;
+              i32 fclen;
+              const void* fc = row_extract_column(&ft_schema, j, fval, (i32)flen, &fclen);
+              if (fc) {
+                if (ft->col_types[j] == KANBUDB_STRING || ft->col_types[j] == KANBUDB_BLOB) {
+                  combined_size += 4 + fclen;
+                } else {
+                  combined_size += fclen;
+                }
+              }
+            }
+
+            u8* combined = (u8*)malloc((size_t)combined_size);
+            if (!combined) continue;
+
+            memcpy(combined, rs->row_data[i], rs->row_lens[i]);
+            i32 off = (i32)rs->row_lens[i];
+
+            for (int j = 0; j < ft->num_cols; j++) {
+              if (j == foreign_col) continue;
+              i32 fclen;
+              const void* fc = row_extract_column(&ft_schema, j, fval, (i32)flen, &fclen);
+              if (fc) {
+                if (ft->col_types[j] == KANBUDB_STRING || ft->col_types[j] == KANBUDB_BLOB) {
+                  u32 slen = (u32)fclen;
+                  memcpy(combined + off, &slen, 4);
+                  off += 4;
+                  memcpy(combined + off, fc, (size_t)fclen);
+                  off += fclen;
+                } else {
+                  memcpy(combined + off, fc, (size_t)fclen);
+                  off += fclen;
+                }
+              }
+            }
+
+            free(rs->row_data[i]);
+            rs->row_data[i] = combined;
+            rs->row_lens[i] = (size_t)combined_size;
+          }
+
+          rs->num_cols = new_num_cols;
+          for (int i = 0; i < new_num_cols; i++) {
+            rs->col_types[i] = new_types[i];
+            rs->col_names[i] = new_names[i];
+          }
+        }
+      }
+    }
+  }
+
   /* Set result set row count */
   rs->num_rows = rs->row_count;
 
@@ -446,9 +665,18 @@ int rs_get_column(result_set_t* rs, int col, void** data, size_t* len) {
     return KANBUDB_OK;
   }
 
-  /* v1 stub: no data rows for non-FTS */
-  *data = NULL;
-  *len = 0;
+  if (!rs->is_fts) {
+    size_t col_len;
+    const void* col_data = rs_get_row_column(rs, rs->current, col, &col_len);
+    if (col_data) {
+      *data = (void*)col_data;
+      *len = col_len;
+    } else {
+      *data = NULL;
+      *len = 0;
+    }
+    return KANBUDB_OK;
+  }
 
   return KANBUDB_OK;
 }
