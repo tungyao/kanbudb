@@ -109,6 +109,10 @@ if(KANBUDB_BUILD_TESTS)
   add_executable(bench_basic test/bench/bench_basic.c)
   target_include_directories(bench_basic PRIVATE src)
   target_link_libraries(bench_basic kanbudb_static)
+
+  add_executable(bench_persist test/bench/bench_persist.c)
+  target_include_directories(bench_persist PRIVATE src src/storage)
+  target_link_libraries(bench_persist kanbudb_static)
 endif()
 
 add_custom_target(amalgamate

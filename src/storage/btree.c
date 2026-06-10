@@ -149,6 +149,16 @@ static int node_insert_nonfull(btree_node_t* n,
   int i = n->num_keys - 1;
 
   if (n->is_leaf) {
+    /* Check if key already exists — update it */
+    for (int j = 0; j < n->num_keys; j++) {
+      if (key_cmp(key, key_len, n->keys[j], n->key_lens[j]) == 0) {
+        free(n->values[j]);
+        n->values[j] = val_dup(value, val_len);
+        n->val_lens[j] = val_len;
+        return KANBUDB_OK;
+      }
+    }
+    /* Not found — insert in sorted order */
     while (i >= 0 && key_cmp(key, key_len, n->keys[i], n->key_lens[i]) < 0) {
       n->keys[i + 1] = n->keys[i];
       n->key_lens[i + 1] = n->key_lens[i];

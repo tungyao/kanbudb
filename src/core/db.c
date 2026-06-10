@@ -272,6 +272,21 @@ static int db_compact_sstables(struct kanbudb_db* db) {
   return rc;
 }
 
+/* ── SSTable path comparison (sort by seq number) ─────────── */
+
+static int sst_path_cmp(const void* a, const void* b) {
+  const char* pa = *(const char**)a;
+  const char* pb = *(const char**)b;
+  /* Extract last numeric field after the final '.' */
+  const char* da = strrchr(pa, '.');
+  const char* db = strrchr(pb, '.');
+  uint64_t sa = da ? (uint64_t)atoll(da + 1) : 0;
+  uint64_t sb = db ? (uint64_t)atoll(db + 1) : 0;
+  if (sa < sb) return -1;
+  if (sa > sb) return 1;
+  return 0;
+}
+
 /* ── Persistent sequence counter for SSTable naming ───────── */
 
 static uint64_t db_persistent_seq(const char* db_path) {
@@ -397,10 +412,18 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
     }
   }
 
-  /* Phase 2: load data SSTables into B-tree */
+  /* Phase 2: load data SSTables into B-tree (sorted by seq) */
   {
     char* sst_paths[256];
     int num_sst = sstable_scan_dir(path, sst_paths, 256, NULL);
+
+    /* Sort by sequence number so newer data overwrites older */
+    if (num_sst > 1) {
+      qsort(sst_paths, (size_t)num_sst, sizeof(char*), &sst_path_cmp);
+    }
+
+    (void)0; /* debug placeholder */
+
     for (int i = 0; i < num_sst; i++) {
       sstable_reader_t* sr = sstable_reader_open(sst_paths[i]);
       if (sr) {
