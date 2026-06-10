@@ -1,0 +1,12 @@
+{
+  "name": "kanbudb-db",
+  "version": "0.1.0",
+  "description": "KanbuDB Embedded Database — Node.js bindings",
+  "main": "index.js",
+  "dependencies": {
+    "koffi": "^2.16.2"
+  },
+  "scripts": {
+    "test": "node test.js"
+  }
+}
