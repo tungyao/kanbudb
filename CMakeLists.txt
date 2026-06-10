@@ -14,6 +14,7 @@ set(KANBUDB_SOURCES
   src/storage/lsm.c
   src/storage/btree.c
   src/storage/compaction.c
+  src/storage/sstable.c
   src/core/db.c
   src/query/query_builder.c
   src/fts/tokenizer.c
@@ -85,10 +86,20 @@ if(KANBUDB_BUILD_TESTS)
   target_link_libraries(test_fts_integration kanbudb_static)
   add_test(NAME test_fts_integration COMMAND test_fts_integration)
 
+  add_executable(test_sstable test/unit/test_sstable.c)
+  target_include_directories(test_sstable PRIVATE src/storage src/util)
+  target_link_libraries(test_sstable kanbudb_static)
+  add_test(NAME test_sstable COMMAND test_sstable)
+
   add_executable(test_compaction test/unit/test_compaction.c)
   target_include_directories(test_compaction PRIVATE src/storage src/util)
   target_link_libraries(test_compaction kanbudb_static)
   add_test(NAME test_compaction COMMAND test_compaction)
+
+  add_executable(test_persistence test/integration/test_persistence.c)
+  target_include_directories(test_persistence PRIVATE src)
+  target_link_libraries(test_persistence kanbudb_static)
+  add_test(NAME test_persistence COMMAND test_persistence)
 
   add_executable(test_e2e test/integration/test_e2e.c)
   target_include_directories(test_e2e PRIVATE src)

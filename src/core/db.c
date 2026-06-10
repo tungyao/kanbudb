@@ -5,6 +5,7 @@
 #include "lsm.h"
 #include "btree.h"
 #include "wal.h"
+#include "sstable.h"
 #include "fts/index.h"
 #include "fts/tokenizer.h"
 #include "fts/parser.h"
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static const db_config_t default_config = {
   KANBUDB_FSYNC_NONE,
@@ -19,6 +21,104 @@ static const db_config_t default_config = {
   65536,
   1
 };
+
+/* ── Forward declare flush context struct ─────────────────── */
+struct sstable_flush_ctx {
+  sstable_writer_t* w;
+  int had_error;
+};
+
+/* ── Flush writer callback ───────────────────────────────── */
+static int flush_write_cb(const lsm_entry_t* e, void* ctx) {
+  struct sstable_flush_ctx* fc = (struct sstable_flush_ctx*)ctx;
+  uint8_t flag = e->deleted ? KANBUDB_SSTABLE_FLAG_TOMBSTONE
+                            : KANBUDB_SSTABLE_FLAG_ALIVE;
+  int rc = sstable_writer_add(fc->w, e->key, e->key_len,
+                               e->value, e->val_len, flag);
+  if (rc != KANBUDB_OK) fc->had_error = 1;
+  return rc;
+}
+
+/* ── WAL replay callback ──────────────────────────────────── */
+static int wal_replay_cb(int op, uint64_t table_id,
+                          const void* key, size_t key_len,
+                          const void* value, size_t val_len,
+                          void* ctx) {
+  struct kanbudb_db* db = (struct kanbudb_db*)ctx;
+  (void)table_id;
+  if (op == KANBUDB_WAL_PUT) {
+    return lsm_put(db->lsm, table_id, key, key_len, value, val_len);
+  } else {
+    return lsm_delete(db->lsm, table_id, key, key_len);
+  }
+}
+
+/* ── SSTable scan → B-tree load callback ─────────────────── */
+static int sstable_load_cb(const void* key, size_t key_len,
+                            const void* value, size_t val_len,
+                            uint8_t flag, void* ctx) {
+  struct kanbudb_db* db = (struct kanbudb_db*)ctx;
+  if (flag & KANBUDB_SSTABLE_FLAG_TOMBSTONE) {
+    return KANBUDB_OK; /* skip deleted keys */
+  }
+  return btree_put(db->btree, key, key_len, value, val_len);
+}
+
+/* ── Flush memtable to SSTable and load into B-tree ──────── */
+static int db_flush_memtable(struct kanbudb_db* db) {
+  if (!db) return KANBUDB_ERR_INVAL;
+
+  /* Swap active → flushing, create new active */
+  int rc = lsm_flush(db->lsm);
+  if (rc != KANBUDB_OK) return rc;
+
+  uint64_t seq = lsm_next_seq(db->lsm);
+
+  /* Build path: {dbpath}.sst.0.{seq} */
+  char sst_path[512];
+  char tmp_path[512];
+  snprintf(sst_path, sizeof(sst_path), "%s.sst.0.%llu",
+           db->path, (unsigned long long)seq);
+  snprintf(tmp_path, sizeof(tmp_path), "%s.sst.0.%llu.tmp",
+           db->path, (unsigned long long)seq);
+
+  sstable_writer_t* w = sstable_writer_create(tmp_path, sst_path, seq);
+  if (!w) {
+    lsm_destroy_flushing(db->lsm);
+    return KANBUDB_ERR_OOM;
+  }
+
+  /* Iterate flushing memtable and write to SSTable */
+  struct sstable_flush_ctx fctx;
+  fctx.w = w;
+  fctx.had_error = 0;
+
+  rc = lsm_iterate_flushing(db->lsm, &flush_write_cb, &fctx);
+  if (rc != KANBUDB_OK || fctx.had_error) {
+    sstable_writer_destroy(w);
+    lsm_destroy_flushing(db->lsm);
+    return KANBUDB_ERR_IO;
+  }
+
+  rc = sstable_writer_finish(w);
+  sstable_writer_destroy(w);
+  if (rc != KANBUDB_OK) {
+    lsm_destroy_flushing(db->lsm);
+    return rc;
+  }
+
+  /* Load the new SSTable into B-tree */
+  sstable_reader_t* sr = sstable_reader_open(sst_path);
+  if (sr) {
+    sstable_reader_scan(sr, &sstable_load_cb, db);
+    sstable_reader_close(sr);
+  }
+
+  /* Done with flushing memtable */
+  lsm_destroy_flushing(db->lsm);
+
+  return KANBUDB_OK;
+}
 
 static int find_table(struct kanbudb_db* db, const char* name) {
   for (int i = 0; i < db->num_tables; i++) {
@@ -82,6 +182,31 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
 
   db->num_tables = 0;
   db->last_error = KANBUDB_OK;
+
+  /* ── Recover from disk state ─────────────────────────── */
+
+  /* 1. Scan and load existing SSTables into B-tree */
+  {
+    char* sst_paths[256];
+    int num_sst = sstable_scan_dir(path, sst_paths, 256, NULL);
+    for (int i = 0; i < num_sst; i++) {
+      sstable_reader_t* sr = sstable_reader_open(sst_paths[i]);
+      if (sr) {
+        sstable_reader_scan(sr, &sstable_load_cb, db);
+        sstable_reader_close(sr);
+      }
+      free(sst_paths[i]);
+    }
+  }
+
+  /* 2. Replay WAL entries that came after the last SSTable flush.
+   *    Since WAL entries are idempotent (PUT overwrites, DELETE
+   *    inserts tombstone), we replay all entries into the LSM.
+   *    This is safe because LSM is checked before B-tree on read,
+   *    so the LSM's fresher data shadows any stale B-tree entry. */
+  {
+    wal_replay(db->wal, &wal_replay_cb, db);
+  }
 
   *out = db;
   return KANBUDB_OK;
@@ -211,6 +336,12 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
   rc = lsm_put(internal->lsm, table_id, key, key_len, value, value_len);
   if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
 
+  /* Auto-flush if memtable is full */
+  if (lsm_is_full(internal->lsm)) {
+    int frc = db_flush_memtable(internal);
+    if (frc != KANBUDB_OK) { internal->last_error = frc; return frc; }
+  }
+
   internal->last_error = KANBUDB_OK;
   return KANBUDB_OK;
 }
@@ -249,6 +380,12 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
 
   rc = lsm_delete(internal->lsm, table_id, key, key_len);
   if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
+
+  /* Auto-flush if memtable is full */
+  if (lsm_is_full(internal->lsm)) {
+    int frc = db_flush_memtable(internal);
+    if (frc != KANBUDB_OK) { internal->last_error = frc; return frc; }
+  }
 
   internal->last_error = KANBUDB_OK;
   return KANBUDB_OK;

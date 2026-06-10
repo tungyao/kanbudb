@@ -207,6 +207,17 @@ kanbudb_btree_t* btree_create(void) {
   return bt;
 }
 
+int btree_build_sorted(kanbudb_btree_t* bt,
+                        const btree_kv_t* items, int num_items) {
+    if (!bt || (!items && num_items > 0)) return KANBUDB_ERR_INVAL;
+    for (int i = 0; i < num_items; i++) {
+        int rc = btree_put(bt, items[i].key, items[i].key_len,
+                           items[i].value, items[i].val_len);
+        if (rc != KANBUDB_OK) return rc;
+    }
+    return KANBUDB_OK;
+}
+
 void btree_destroy(kanbudb_btree_t* bt) {
   if (!bt) return;
   node_destroy(bt->root);

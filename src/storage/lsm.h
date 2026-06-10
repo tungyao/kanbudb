@@ -44,5 +44,14 @@ int           lsm_get(kanbudb_lsm_t* lsm, uint64_t table_id,
 int           lsm_delete(kanbudb_lsm_t* lsm, uint64_t table_id,
                          const void* key, size_t key_len);
 int           lsm_flush(kanbudb_lsm_t* lsm);
+int           lsm_is_full(kanbudb_lsm_t* lsm);
+uint64_t      lsm_next_seq(kanbudb_lsm_t* lsm);
+
+/* Iterate the flushing memtable (after lsm_flush but before it's consumed).
+ * Returns 0 on success, callback return value on abort. */
+int lsm_iterate_flushing(kanbudb_lsm_t* lsm,
+                          int (*cb)(const lsm_entry_t* entry, void* ctx),
+                          void* ctx);
+void lsm_destroy_flushing(kanbudb_lsm_t* lsm);
 
 #endif

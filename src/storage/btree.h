@@ -29,4 +29,9 @@ int             btree_cursor_seek(btree_cursor_t* cur, const void* key, size_t k
 int             btree_cursor_next(btree_cursor_t* cur, btree_kv_t* out);
 void            btree_cursor_destroy(btree_cursor_t* cur);
 
+/* Batch load sorted KV pairs (e.g. from SSTable scan).
+ * Items must be sorted by key. Returns OK or OOM. */
+int btree_build_sorted(kanbudb_btree_t* bt,
+                       const btree_kv_t* items, int num_items);
+
 #endif

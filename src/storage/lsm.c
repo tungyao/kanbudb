@@ -253,6 +253,7 @@ struct kanbudb_lsm {
   size_t memtable_size;
   kanbudb_memtable_t* active;
   kanbudb_memtable_t* flushing;
+  uint64_t next_seq;   /* for SSTable sequence numbering */
 };
 
 kanbudb_lsm_t* lsm_create(const char* path, size_t memtable_size) {
@@ -327,4 +328,26 @@ int lsm_flush(kanbudb_lsm_t* lsm) {
   lsm->active = memtable_create(lsm->memtable_size);
   if (!lsm->active) return KANBUDB_ERR_OOM;
   return KANBUDB_OK;
+}
+
+int lsm_is_full(kanbudb_lsm_t* lsm) {
+  return lsm ? memtable_is_full(lsm->active) : 0;
+}
+
+uint64_t lsm_next_seq(kanbudb_lsm_t* lsm) {
+  if (!lsm) return 0;
+  return lsm->next_seq++;
+}
+
+int lsm_iterate_flushing(kanbudb_lsm_t* lsm,
+                          int (*cb)(const lsm_entry_t* entry, void* ctx),
+                          void* ctx) {
+  if (!lsm || !cb || !lsm->flushing) return KANBUDB_ERR_INVAL;
+  return memtable_iterate(lsm->flushing, cb, ctx);
+}
+
+void lsm_destroy_flushing(kanbudb_lsm_t* lsm) {
+  if (!lsm) return;
+  memtable_destroy(lsm->flushing);
+  lsm->flushing = NULL;
 }
