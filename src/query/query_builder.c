@@ -3,6 +3,7 @@
 #include "macros.h"
 #include "core/db.h"
 #include "lsm.h"
+#include "btree.h"
 #include "row_format.h"
 
 #include <stdio.h>
@@ -133,13 +134,78 @@ int qb_join(query_builder_t* qb, const char* table,
   return KANBUDB_OK;
 }
 
+static i64 parse_int(const char* s) {
+  return (i64)atoll(s);
+}
+static f64 parse_double(const char* s) {
+  return atof(s);
+}
+
+int filter_match(const void* col_data, i32 col_len,
+                  kanbudb_col_type_t type, const char* op, const char* literal) {
+  if (!col_data || !op || !literal) return 0;
+
+  int cmp = 0;
+  switch (type) {
+    case KANBUDB_INT32:
+    case KANBUDB_INT64: {
+      i64 col_val = (type == KANBUDB_INT32)
+        ? (i64)*(const i32*)col_data
+        : *(const i64*)col_data;
+      i64 lit_val = parse_int(literal);
+      if (col_val < lit_val) cmp = -1;
+      else if (col_val > lit_val) cmp = 1;
+      else cmp = 0;
+      break;
+    }
+    case KANBUDB_FLOAT:
+    case KANBUDB_DOUBLE: {
+      f64 col_val = (type == KANBUDB_FLOAT)
+        ? (f64)*(const f32*)col_data
+        : *(const f64*)col_data;
+      f64 lit_val = parse_double(literal);
+      if (col_val < lit_val) cmp = -1;
+      else if (col_val > lit_val) cmp = 1;
+      else cmp = 0;
+      break;
+    }
+    case KANBUDB_BOOL: {
+      int col_val = *(const u8*)col_data ? 1 : 0;
+      int lit_val = (strcmp(literal, "true") == 0 || strcmp(literal, "1") == 0) ? 1 : 0;
+      if (col_val < lit_val) cmp = -1;
+      else if (col_val > lit_val) cmp = 1;
+      else cmp = 0;
+      break;
+    }
+    case KANBUDB_STRING: {
+      size_t lit_len = strlen(literal);
+      size_t min_len = (size_t)col_len < lit_len ? (size_t)col_len : lit_len;
+      cmp = memcmp(col_data, literal, min_len);
+      if (cmp == 0) {
+        if ((size_t)col_len < lit_len) cmp = -1;
+        else if ((size_t)col_len > lit_len) cmp = 1;
+      }
+      break;
+    }
+    default:
+      return 0;
+  }
+
+  if (strcmp(op, "=") == 0) return cmp == 0;
+  if (strcmp(op, "!=") == 0) return cmp != 0;
+  if (strcmp(op, ">") == 0) return cmp > 0;
+  if (strcmp(op, "<") == 0) return cmp < 0;
+  if (strcmp(op, ">=") == 0) return cmp >= 0;
+  if (strcmp(op, "<=") == 0) return cmp <= 0;
+  return 0;
+}
+
 result_set_t* qb_exec(query_builder_t* qb) {
   if (!qb) return NULL;
 
   result_set_t* rs = (result_set_t*)calloc(1, sizeof(*rs));
   if (!rs) return NULL;
 
-  /* v1 stub: return empty result set */
   rs->num_rows = 0;
   rs->current = -1;
   rs->num_cols = 0;
@@ -157,6 +223,52 @@ result_set_t* qb_exec(query_builder_t* qb) {
       break;
     }
   }
+
+  /* Precompute row schema for column extraction */
+  row_schema_t row_schema;
+  row_schema_init(&row_schema, rs->col_types, rs->num_cols);
+
+  /* Determine filter column index */
+  int filter_col = -1;
+  kanbudb_col_type_t filter_type = KANBUDB_INT32;
+  if (qb->has_filter) {
+    for (int i = 0; i < rs->num_cols; i++) {
+      if (strcmp(rs->col_names[i], qb->filter_column) == 0) {
+        filter_col = i;
+        filter_type = rs->col_types[i];
+        break;
+      }
+    }
+  }
+
+  /* ---- B-tree scan ---- */
+  if (internal->btree) {
+    btree_cursor_t* cur = btree_cursor_create(internal->btree);
+    if (cur) {
+      if (btree_cursor_seek(cur, NULL, 0) == KANBUDB_OK) {
+        btree_kv_t kv;
+        while (btree_cursor_next(cur, &kv) == KANBUDB_OK) {
+          int pass = 1;
+          if (qb->has_filter && filter_col >= 0) {
+            i32 col_len;
+            const void* col_data = row_extract_column(&row_schema, filter_col,
+                                                        kv.value, (i32)kv.val_len, &col_len);
+            if (col_data) {
+              pass = filter_match(col_data, col_len, filter_type,
+                                   qb->filter_op, qb->filter_value);
+            }
+          }
+          if (pass) {
+            rs_add_row(rs, kv.value, kv.val_len);
+          }
+        }
+      }
+      btree_cursor_destroy(cur);
+    }
+  }
+
+  /* Set result set row count */
+  rs->num_rows = rs->row_count;
 
   return rs;
 }
