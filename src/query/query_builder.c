@@ -200,6 +200,82 @@ int filter_match(const void* col_data, i32 col_len,
   return 0;
 }
 
+/* Simple hash set for dedup keys from LSM */
+typedef struct {
+  const void** keys;
+  size_t*      key_lens;
+  int          count;
+  int          capacity;
+} key_set_t;
+
+static void key_set_init(key_set_t* ks) {
+  ks->keys = NULL;
+  ks->key_lens = NULL;
+  ks->count = 0;
+  ks->capacity = 0;
+}
+
+static int key_set_add(key_set_t* ks, const void* key, size_t key_len) {
+  if (ks->count >= ks->capacity) {
+    int new_cap = ks->capacity ? ks->capacity * 2 : 64;
+    void* tmp = realloc(ks->keys, (size_t)new_cap * sizeof(void*));
+    if (!tmp) return KANBUDB_ERR_OOM;
+    ks->keys = (const void**)tmp;
+    tmp = realloc(ks->key_lens, (size_t)new_cap * sizeof(size_t));
+    if (!tmp) return KANBUDB_ERR_OOM;
+    ks->key_lens = (size_t*)tmp;
+    ks->capacity = new_cap;
+  }
+  ks->keys[ks->count] = key;
+  ks->key_lens[ks->count] = key_len;
+  ks->count++;
+  return KANBUDB_OK;
+}
+
+static int key_set_contains(key_set_t* ks, const void* key, size_t key_len) {
+  for (int i = 0; i < ks->count; i++) {
+    if (ks->key_lens[i] == key_len && memcmp(ks->keys[i], key, key_len) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static void key_set_destroy(key_set_t* ks) {
+  free(ks->keys);
+  free(ks->key_lens);
+}
+
+typedef struct {
+  key_set_t*         seen_keys;
+  query_builder_t*   qb;
+  row_schema_t*      row_schema;
+  int                filter_col;
+  kanbudb_col_type_t filter_type;
+  result_set_t*      rs;
+} lsm_scan_ctx_t;
+
+static int lsm_scan_cb(const lsm_entry_t* entry, void* ctx) {
+  lsm_scan_ctx_t* c = (lsm_scan_ctx_t*)ctx;
+  if (entry->deleted) return 0;
+
+  key_set_add(c->seen_keys, entry->key, entry->key_len);
+
+  int pass = 1;
+  if (c->qb->has_filter && c->filter_col >= 0) {
+    i32 col_len;
+    const void* col_data = row_extract_column(c->row_schema, c->filter_col,
+                                                entry->value, (i32)entry->val_len, &col_len);
+    if (col_data) {
+      pass = filter_match(col_data, col_len, c->filter_type,
+                           c->qb->filter_op, c->qb->filter_value);
+    }
+  }
+  if (pass) {
+    rs_add_row(c->rs, entry->value, entry->val_len);
+  }
+  return 0;
+}
+
 result_set_t* qb_exec(query_builder_t* qb) {
   if (!qb) return NULL;
 
@@ -241,13 +317,34 @@ result_set_t* qb_exec(query_builder_t* qb) {
     }
   }
 
-  /* ---- B-tree scan ---- */
+  /* ---- LSM scan first (collect seen keys + matching rows) ---- */
+  key_set_t seen_keys;
+  key_set_init(&seen_keys);
+
+  if (internal->lsm) {
+    lsm_scan_ctx_t ctx;
+    ctx.seen_keys = &seen_keys;
+    ctx.qb = qb;
+    ctx.row_schema = &row_schema;
+    ctx.filter_col = filter_col;
+    ctx.filter_type = filter_type;
+    ctx.rs = rs;
+
+    kanbudb_memtable_t* active = lsm_get_active(internal->lsm);
+    kanbudb_memtable_t* flushing = lsm_get_flushing(internal->lsm);
+    if (active) memtable_iterate(active, lsm_scan_cb, &ctx);
+    if (flushing) memtable_iterate(flushing, lsm_scan_cb, &ctx);
+  }
+
+  /* ---- B-tree scan (skip keys already seen in LSM) ---- */
   if (internal->btree) {
     btree_cursor_t* cur = btree_cursor_create(internal->btree);
     if (cur) {
       if (btree_cursor_seek(cur, NULL, 0) == KANBUDB_OK) {
         btree_kv_t kv;
         while (btree_cursor_next(cur, &kv) == KANBUDB_OK) {
+          if (key_set_contains(&seen_keys, kv.key, kv.key_len))
+            continue;
           int pass = 1;
           if (qb->has_filter && filter_col >= 0) {
             i32 col_len;
@@ -266,6 +363,8 @@ result_set_t* qb_exec(query_builder_t* qb) {
       btree_cursor_destroy(cur);
     }
   }
+
+  key_set_destroy(&seen_keys);
 
   /* Set result set row count */
   rs->num_rows = rs->row_count;

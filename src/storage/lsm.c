@@ -350,6 +350,13 @@ int lsm_iterate_flushing(kanbudb_lsm_t* lsm,
   return memtable_iterate(lsm->flushing, cb, ctx);
 }
 
+kanbudb_memtable_t* lsm_get_active(kanbudb_lsm_t* lsm) {
+  return lsm ? lsm->active : NULL;
+}
+kanbudb_memtable_t* lsm_get_flushing(kanbudb_lsm_t* lsm) {
+  return lsm ? lsm->flushing : NULL;
+}
+
 void lsm_destroy_flushing(kanbudb_lsm_t* lsm) {
   if (!lsm) return;
   memtable_destroy(lsm->flushing);

@@ -48,6 +48,10 @@ int           lsm_is_full(kanbudb_lsm_t* lsm);
 int           lsm_has_data(kanbudb_lsm_t* lsm);
 uint64_t      lsm_next_seq(kanbudb_lsm_t* lsm);
 
+/* Expose memtable access for query scanning */
+kanbudb_memtable_t* lsm_get_active(kanbudb_lsm_t* lsm);
+kanbudb_memtable_t* lsm_get_flushing(kanbudb_lsm_t* lsm);
+
 /* Iterate the flushing memtable (after lsm_flush but before it's consumed).
  * Returns 0 on success, callback return value on abort. */
 int lsm_iterate_flushing(kanbudb_lsm_t* lsm,
