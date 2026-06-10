@@ -17,7 +17,7 @@ classifiers = [
 Homepage = "https://github.com/kanbudb/kanbudb"
 
 [tool.scikit-build]
-cmake.version = "3.14"
+cmake.version = ">=3.14"
 cmake.args = ["-DKANBUDB_BUILD_TESTS=OFF"]
 wheel.packages = ["bindings/python/kanbudb"]
 
