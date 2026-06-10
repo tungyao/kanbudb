@@ -7,7 +7,7 @@ name = "kanbudb"
 version = "0.1.0"
 description = "KanbuDB Embedded Database"
 requires-python = ">=3.8"
-license = { file = "LICENSE" }
+license = { text = "MIT" }
 classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Database :: Database Engines/Servers",
@@ -17,7 +17,7 @@ classifiers = [
 Homepage = "https://github.com/kanbudb/kanbudb"
 
 [tool.scikit-build]
-cmake.minimum-version = "3.14"
+cmake.version = "3.14"
 cmake.args = ["-DKANBUDB_BUILD_TESTS=OFF"]
 wheel.packages = ["bindings/python/kanbudb"]
 
