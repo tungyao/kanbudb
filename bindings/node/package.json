@@ -3,10 +3,19 @@
   "version": "0.1.0",
   "description": "KanbuDB Embedded Database — Node.js bindings",
   "main": "index.js",
+  "scripts": {
+    "install": "node install.js",
+    "test": "node test.js",
+    "prebuild": "node install.js --prebuild-only"
+  },
+  "binary": {
+    "napi_versions": [0],
+    "module_name": "kanbudb",
+    "host": "https://github.com/kanbudb/kanbudb-db/releases/download/",
+    "remote_path": "v{version}",
+    "package_name": "prebuild-{platform}-{arch}.tar.gz"
+  },
   "dependencies": {
     "koffi": "^2.16.2"
-  },
-  "scripts": {
-    "test": "node test.js"
   }
 }

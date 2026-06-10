@@ -18,14 +18,18 @@ from typing import Optional, Any
 
 # ── Load shared library ──────────────────────────────────────────────
 
-_lib_path = os.environ.get(
-    "KANBUDB_LIB",
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "build",     "libkanbudb_shared.so"),
-)
-if not os.path.exists(_lib_path):
-    _lib_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "build", "libkanbudb_shared.dylib")
-if not os.path.exists(_lib_path):
-    raise RuntimeError(f"KanbuDB library not found. Set KANBUDB_LIB env var. Tried: {_lib_path}")
+_lib_path = os.environ.get("KANBUDB_LIB", "")
+if not _lib_path or not os.path.exists(_lib_path):
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "libkanbudb_shared.so"),
+        os.path.join(os.path.dirname(__file__), "libkanbudb_shared.dylib"),
+        os.path.join(os.path.dirname(__file__), "libkanbudb_shared.dll"),
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "build", "libkanbudb_shared.so"),
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "build", "libkanbudb_shared.dylib"),
+    ]
+    _lib_path = next((p for p in candidates if os.path.exists(p)), "")
+if not _lib_path:
+    raise RuntimeError(f"KanbuDB library not found. Set KANBUDB_LIB env var.")
 
 _lib = ctypes.cdll.LoadLibrary(_lib_path)
 

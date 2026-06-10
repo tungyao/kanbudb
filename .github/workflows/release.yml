@@ -1,0 +1,86 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  pypi:
+    name: Build & publish to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels (linux x86_64)
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp38-* cp39-* cp310-* cp311-* cp312-*"
+          CIBW_ARCHS: x86_64
+          CIBW_BEFORE_BUILD: >
+            pip install scikit-build-core
+          CIBW_BUILD_FRONTEND: build
+
+      - name: Upload wheels to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          pip install twine
+          twine upload wheelhouse/*.whl
+
+  npm:
+    name: Build & publish to npm
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build shared library
+        run: |
+          cmake -B build -DKANBUDB_BUILD_TESTS=OFF
+          cmake --build build
+
+      - name: Package prebuilt binary
+        run: |
+          mkdir -p prebuilds/${{ runner.os == 'macOS' && 'macos' || 'linux' }}-x86_64
+          cp build/libkanbudb_shared.${{ runner.os == 'macOS' && 'dylib' || 'so' }} \
+             prebuilds/${{ runner.os == 'macOS' && 'macos' || 'linux' }}-x86_64/
+          tar -czf prebuild-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-x86_64.tar.gz \
+             -C prebuilds/${{ runner.os == 'macOS' && 'macos' || 'linux' }}-x86_64 .
+
+      - name: Upload prebuilt binary to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: prebuild-*.tar.gz
+
+      - name: Publish to npm
+        working-directory: bindings/node
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  gomod:
+    name: Tag Go module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version from tag
+        id: version
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Tag Go submodule
+        run: |
+          git tag "go-kanbudb/${{ steps.version.outputs.v }}"
+          git push origin "go-kanbudb/${{ steps.version.outputs.v }}"
+        working-directory: bindings/go_kanbudb

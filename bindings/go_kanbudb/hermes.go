@@ -1,19 +1,21 @@
 // Package kanbudb provides Go bindings for the KanbuDB Embedded Database.
 //
-// Build the C library first:
+// Build C library first (or use cgo direct compilation):
 //
 //	cd kanbudb && cmake -B build && cmake --build build
-//
-// Then use with CGo:
-//
 //	export CGO_LDFLAGS="-L$(pwd)/build -lkanbudb_shared"
 //	export CGO_CFLAGS="-I$(pwd)/include"
-//	go run main.go
+//	go build ./...
+//
+// Or for standalone Go module builds (requires C compiler):
+//
+//	go generate ./...
+//	go build ./...
 package kanbudb
 
 /*
-#cgo LDFLAGS: -lkanbudb_shared
-#cgo CFLAGS: -I${SRCDIR}/../../include
+#cgo LDFLAGS: -lkanbudb_shared -lm
+#cgo CFLAGS: -I${SRCDIR}/../../include -I${SRCDIR}/../../src -I${SRCDIR}/../../src/util
 
 #include "db.h"
 #include <stdlib.h>

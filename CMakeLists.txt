@@ -119,3 +119,5 @@ add_custom_target(amalgamate
   COMMAND ${CMAKE_COMMAND} -E env python3 tools/amalgamate.py
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
+
+install(TARGETS kanbudb_shared LIBRARY DESTINATION . COMPONENT python)
