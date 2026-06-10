@@ -75,9 +75,71 @@ static int test_e2e_full_workflow(void) {
   return rc == KANBUDB_OK ? 1 : 0;
 }
 
+static int test_e2e_queries(void) {
+  cleanup();
+
+  db_config_t config;
+  config.fsync_mode = KANBUDB_FSYNC_NONE;
+  config.cache_size = 4096;
+  config.memtable_size = 4096;
+  config.compaction_threads = 1;
+
+  db_t* db = NULL;
+  if (db_open(TEST_DB_PATH, &config, &db) != KANBUDB_OK || !db) return 0;
+
+  const char* col_names[] = {"id", "title", "score"};
+  kanbudb_col_type_t col_types[] = {KANBUDB_INT32, KANBUDB_STRING, KANBUDB_INT32};
+  if (db_create_table(db, "items", col_names, col_types, 3, "id") != KANBUDB_OK) {
+    db_close(db); return 0;
+  }
+
+  u8 buf[256];
+  for (int i = 0; i < 10; i++) {
+    char title[32]; snprintf(title, sizeof(title), "item_%d", i);
+    i32 id = (i32)(i + 1);
+    *(i32*)buf = id;
+    u32 tlen = (u32)strlen(title);
+    memcpy(buf + 4, &tlen, 4);
+    memcpy(buf + 8, title, tlen);
+    *(i32*)(buf + 8 + tlen) = (i32)((i + 1) * 10);
+    i32 row_len = 8 + (i32)tlen + 4;
+
+    char key[16]; snprintf(key, sizeof(key), "key_%d", i);
+    db_put(db, "items", key, strlen(key) + 1, buf, (size_t)row_len);
+  }
+
+  /* Range + sort + limit combined */
+  query_builder_t* qb = db_query(db, "items");
+  qb_filter(qb, "score", ">", "50");
+  qb_sort(qb, "score", 0);
+  qb_limit(qb, 3);
+
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); return 0; }
+
+  i32 expected[] = {100, 90, 80};
+  int idx = 0;
+  while (rs_next(rs)) {
+    void* score_data; size_t score_len;
+    rs_get_column(rs, 2, &score_data, &score_len);
+    if (score_len != 4) { rs_close(rs); qb_destroy(qb); db_close(db); return 0; }
+    i32 score = *(const i32*)score_data;
+    if (idx < 3 && score != expected[idx]) { rs_close(rs); qb_destroy(qb); db_close(db); return 0; }
+    idx++;
+  }
+  if (idx != 3) { rs_close(rs); qb_destroy(qb); db_close(db); return 0; }
+  rs_close(rs);
+  qb_destroy(qb);
+
+  db_close(db);
+  cleanup();
+  return 1;
+}
+
 int main(void) {
   printf("e2e integration tests:\n");
   TEST(e2e_full_workflow);
+  TEST(e2e_queries);
   printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
   return tests_failed > 0 ? 1 : 0;
 }
