@@ -69,10 +69,18 @@ typedef struct {
 
 ```c
 // Open or create a database. config may be NULL for defaults.
-// Creates <path>.wal and <path>.lsm files.
+// Creates/opens:
+//   <path>.wal    — Write-ahead log for crash recovery
+//   <path>.seq    — Persistent SSTable sequence counter
+// On startup, automatically:
+//   1. loads <path>.system → restores table schemas
+//   2. loads <path>.sst.*   → rebuilds B-tree cold store
+//   3. replays <path>.wal   → recovers unflushed writes
 int db_open(const char *path, const db_config_t *config, db_t **out);
 
-// Close database, flush all data, free resources.
+// Close database.
+// Flushes remaining memtable → SSTable, saves schema to .system,
+// takes a B-tree checkpoint to .ckpt.*, truncates WAL, frees resources.
 int db_close(db_t *db);
 
 // Return the last error code set by any operation.
@@ -190,17 +198,26 @@ int db_fts_drop_index(db_t *db, const char *table, const char *column);
 ## Architecture (data flow)
 
 ```
-db_put() → WAL (append) → LSM memtable (skip list)
-                               │
-                      memtable full?
-                               │
-                          flush → SSTable
-                               │
-                     compaction → B+tree (hot data)
+写入:
+  db_put() → WAL append → LSM memtable
+                          ↓ memtable full?
+                    flush → SSTable → 加载到 B-tree
 
-db_get() → LSM memtable (fast) → B+tree (fallback)
+启动恢复:
+  db_open() → 扫描 *.sst → 加载到 B-tree → wal_replay → 就绪
 
-db_fts_search() → query parser → FST inverted index → BM25 ranker → result set
+关闭:
+  db_close() → flush memtable → 保存 schema → checkpoint → 截断 WAL
+
+读取:
+  db_get() → LSM memtable (最快) → B-tree (后备)
+
+持久化文件:
+  <path>.wal       — WAL (崩溃恢复, flush 后截断)
+  <path>.sst.0.N   — SSTable (排序键值对)
+  <path>.ckpt.N    — B-tree 检查点
+  <path>.system    — 表 schema
+  <path>.seq       — SSTable 序列号
 ```
 
 ## Internal modules
@@ -213,7 +230,8 @@ db_fts_search() → query parser → FST inverted index → BM25 ranker → resu
 | WAL | `src/storage/wal.{h,c}` | Binary log, magic/version header, replay callback |
 | LSM | `src/storage/lsm.{h,c}` | Skip-list memtable (level 12), auto-flush |
 | B+tree | `src/storage/btree.{h,c}` | Order 16, split-on-full, leaf-linked cursor |
-| Compaction | `src/storage/compaction.{h,c}` | LSM→B+tree merge (v1 stub) |
+| SSTable | `src/storage/sstable.{h,c}` | 持久化键值文件格式, 稀疏索引, CRC校验 |
+| Compaction | `src/storage/compaction.{h,c}` | 多SSTable归并去重 |
 | Tokenizer | `src/fts/tokenizer.{h,c}` | Unicode split, Snowball-like stemmer, stopwords |
 | FTS Index | `src/fts/index.{h,c}` | Inverted index wrapping FST |
 | FTS Parser | `src/fts/parser.{h,c}` | Lucene-like query syntax parser |
@@ -233,8 +251,9 @@ cd build && ctest --output-on-failure
 # Run single test
 make test_db && ./test_db
 
-# Run benchmark
+# Run benchmarks
 make bench_basic && ./bench_basic
+make bench_persist && ./bench_persist   # 80K 持久化压测
 
 # Generate single-file distribution
 make amalgamate

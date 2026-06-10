@@ -239,29 +239,56 @@ gcc -o example example.c -Iinclude -Lbuild -lkanbudb_static
 
 ---
 
-## 8. 架构说明
+## 8. 持久化与架构
+
+### 持久化文件
+
+| 文件 | 作用 |
+|------|------|
+| `<path>.wal` | WAL, 崩溃恢复, flush 后被截断 |
+| `<path>.sst.0.N` | SSTable, memtable flush 后的排序数据 |
+| `<path>.ckpt.N` | db_close 时的 B-tree 快照 |
+| `<path>.system` | 表 schema 持久化 |
+| `<path>.seq` | SSTable 全局单调序列号 |
+
+### 启动恢复流程
 
 ```
-┌─────────────────────────────────────────┐
-│              Public C API               │
-│  db_open / db_put / db_query / fts...   │
-├────────────────┬────────────────────────┤
-│   Core DB      │    Query Builder       │
-│  (table mgmt)  │   (fluent API)         │
-├────────┬───────┴──┬─────────────────────┤
-│  WAL   │   LSM    │       B+tree        │
-│(crash  │(memtable │    (read path,      │
-│recovery│ + flush) │   hot data)         │
-├────────┴──────────┴─────────────────────┤
-│           FTS 引擎                       │
-│   Tokenizer → Index → Parser → Ranker   │
-├─────────────────────────────────────────┤
-│          Util 层                         │
-│   Arena 分配器 / Page Cache / FST / BM25 │
-└─────────────────────────────────────────┘
+db_open:
+  1. 加载 .system → 恢复所有表 schema
+  2. 扫描 *.sst → 加载到 B-tree（按 seq 排序）
+  3. wal_replay → LSM 恢复未 flush 的写入
+```
+
+重启后表名自动可用, 无需重新 `db_create_table`。
+
+### 架构图
+
+```
+┌──────────────────────────────────────────────┐
+│              Public C API                    │
+│  db_open / db_put / db_get / db_query / fts │
+├────────────────┬─────────────────────────────┤
+│   Core DB      │    Query Builder            │
+│  (table mgmt)  │   (fluent API)              │
+├────────┬───────┴──┬──────────────────────────┤
+│  WAL   │   LSM    │       B+tree             │
+│(crash  │(memtable │    (cold store,           │
+│recovery│ + flush) │   重建自 SSTable)         │
+├────────┴──────────┴──────────────────────────┤
+│  SSTable                                     │
+│  (持久化排序键值, 稀疏索引, CRC校验)          │
+├──────────────────────────────────────────────┤
+│           FTS 引擎                            │
+│   Tokenizer → Index → Parser → Ranker        │
+├──────────────────────────────────────────────┤
+│          Util 层                              │
+│   Arena / Page Cache / FST / BM25            │
+└──────────────────────────────────────────────┘
 ```
 
 - 写入路径: `db_put → WAL append → LSM memtable`
-- 读取路径: `db_get → LSM memtable → B+tree (如果 LSM 未命中)`
-- 压缩路径: `memtable 满 → flush 为 SSTable → compact 合并到 B+tree`
-- FTS 路径: `文本 → tokenizer → 倒排索引 (FST 字典) → BM25 排序`
+- 读取路径: `db_get → LSM memtable → B+tree`
+- 刷新路径: `memtable 满 → flush → SSTable → B-tree`
+- 启动恢复: `db_open → .system + *.sst + WAL replay`
+- FTS 路径: `文本 → tokenizer → 倒排索引 (FST) → BM25`
