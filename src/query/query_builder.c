@@ -3,6 +3,7 @@
 #include "macros.h"
 #include "core/db.h"
 #include "lsm.h"
+#include "row_format.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,6 +165,40 @@ void qb_destroy(query_builder_t* qb) {
   free(qb);
 }
 
+int rs_add_row(result_set_t* rs, const void* data, size_t len) {
+  if (!rs) return KANBUDB_ERR_INVAL;
+  if (rs->row_count >= rs->row_capacity) {
+    int new_cap = rs->row_capacity ? rs->row_capacity * 2 : 64;
+    void** new_data = (void**)realloc(rs->row_data, (size_t)new_cap * sizeof(void*));
+    size_t* new_lens = (size_t*)realloc(rs->row_lens, (size_t)new_cap * sizeof(size_t));
+    if (!new_data || !new_lens) return KANBUDB_ERR_OOM;
+    rs->row_data = new_data;
+    rs->row_lens = new_lens;
+    rs->row_capacity = new_cap;
+  }
+  void* copy = malloc(len);
+  if (!copy) return KANBUDB_ERR_OOM;
+  memcpy(copy, data, len);
+  rs->row_data[rs->row_count] = copy;
+  rs->row_lens[rs->row_count] = len;
+  rs->row_count++;
+  return KANBUDB_OK;
+}
+
+const void* rs_get_row_column(result_set_t* rs, int row_idx, int col, size_t* out_len) {
+  if (!rs || row_idx < 0 || row_idx >= rs->row_count || col < 0 || col >= rs->num_cols) {
+    if (out_len) *out_len = 0;
+    return NULL;
+  }
+  row_schema_t schema;
+  row_schema_init(&schema, rs->col_types, rs->num_cols);
+  i32 len;
+  const void* ptr = row_extract_column(&schema, col, rs->row_data[row_idx],
+                                         (i32)rs->row_lens[row_idx], &len);
+  if (out_len) *out_len = (size_t)len;
+  return ptr;
+}
+
 int rs_next(result_set_t* rs) {
   if (!rs) return 0;
 
@@ -225,5 +260,10 @@ void rs_close(result_set_t* rs) {
     free(rs->doc_ids);
     free(rs->scores);
   }
+  for (int i = 0; i < rs->row_count; i++) {
+    free(rs->row_data[i]);
+  }
+  free(rs->row_data);
+  free(rs->row_lens);
   free(rs);
 }
