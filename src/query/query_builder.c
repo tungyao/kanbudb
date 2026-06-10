@@ -218,12 +218,12 @@ static void key_set_init(key_set_t* ks) {
 static int key_set_add(key_set_t* ks, const void* key, size_t key_len) {
   if (ks->count >= ks->capacity) {
     int new_cap = ks->capacity ? ks->capacity * 2 : 64;
-    void* tmp = realloc(ks->keys, (size_t)new_cap * sizeof(void*));
-    if (!tmp) return KANBUDB_ERR_OOM;
-    ks->keys = (const void**)tmp;
-    tmp = realloc(ks->key_lens, (size_t)new_cap * sizeof(size_t));
-    if (!tmp) return KANBUDB_ERR_OOM;
-    ks->key_lens = (size_t*)tmp;
+    const void** new_keys = (const void**)realloc(ks->keys, (size_t)new_cap * sizeof(void*));
+    if (!new_keys) return KANBUDB_ERR_OOM;
+    size_t* new_lens = (size_t*)realloc(ks->key_lens, (size_t)new_cap * sizeof(size_t));
+    if (!new_lens) return KANBUDB_ERR_OOM;
+    ks->keys = new_keys;
+    ks->key_lens = new_lens;
     ks->capacity = new_cap;
   }
   ks->keys[ks->count] = key;
@@ -277,23 +277,46 @@ static int lsm_scan_cb(const lsm_entry_t* entry, void* ctx) {
 }
 
 typedef struct {
-  f64  key;
   int  idx;
 } sort_entry_t;
 
-static int sort_entry_cmp_asc(const void* a, const void* b) {
-  f64 ka = ((const sort_entry_t*)a)->key;
-  f64 kb = ((const sort_entry_t*)b)->key;
-  if (ka < kb) return -1;
-  if (ka > kb) return 1;
-  return 0;
-}
-static int sort_entry_cmp_desc(const void* a, const void* b) {
-  f64 ka = ((const sort_entry_t*)a)->key;
-  f64 kb = ((const sort_entry_t*)b)->key;
-  if (ka > kb) return -1;
-  if (ka < kb) return 1;
-  return 0;
+/* Sort context for qsort comparator */
+typedef struct {
+  const void**     row_data;
+  const size_t*    row_lens;
+  row_schema_t     schema;
+  int              col;
+  kanbudb_col_type_t type;
+  int              ascending;
+} sort_ctx_t;
+
+static sort_ctx_t sort_ctx;
+
+static int sort_entry_cmp(const void* a, const void* b) {
+  const sort_entry_t* ea = (const sort_entry_t*)a;
+  const sort_entry_t* eb = (const sort_entry_t*)b;
+  i32 len_a, len_b;
+  const void* da = row_extract_column(&sort_ctx.schema, sort_ctx.col,
+                                       sort_ctx.row_data[ea->idx],
+                                       (i32)sort_ctx.row_lens[ea->idx], &len_a);
+  const void* db = row_extract_column(&sort_ctx.schema, sort_ctx.col,
+                                       sort_ctx.row_data[eb->idx],
+                                       (i32)sort_ctx.row_lens[eb->idx], &len_b);
+  int cmp = 0;
+  if (sort_ctx.type == KANBUDB_STRING) {
+    size_t min = (size_t)(len_a < len_b ? len_a : len_b);
+    cmp = memcmp(da, db, min);
+    if (cmp == 0) cmp = (len_a < len_b) ? -1 : (len_a > len_b) ? 1 : 0;
+  } else if (sort_ctx.type == KANBUDB_INT32 || sort_ctx.type == KANBUDB_INT64 || sort_ctx.type == KANBUDB_BOOL) {
+    i64 va = sort_ctx.type == KANBUDB_INT32 ? *(const i32*)da : sort_ctx.type == KANBUDB_INT64 ? *(const i64*)da : *(const u8*)da;
+    i64 vb = sort_ctx.type == KANBUDB_INT32 ? *(const i32*)db : sort_ctx.type == KANBUDB_INT64 ? *(const i64*)db : *(const u8*)db;
+    if (va < vb) cmp = -1; else if (va > vb) cmp = 1;
+  } else {
+    f64 va = sort_ctx.type == KANBUDB_FLOAT ? *(const f32*)da : *(const f64*)da;
+    f64 vb = sort_ctx.type == KANBUDB_FLOAT ? *(const f32*)db : *(const f64*)db;
+    if (va < vb) cmp = -1; else if (va > vb) cmp = 1;
+  }
+  return sort_ctx.ascending ? cmp : -cmp;
 }
 
 result_set_t* qb_exec(query_builder_t* qb) {
@@ -396,41 +419,19 @@ result_set_t* qb_exec(query_builder_t* qb) {
       }
     }
     if (sort_col >= 0) {
+      sort_ctx.row_data = (const void**)rs->row_data;
+      sort_ctx.row_lens = rs->row_lens;
+      row_schema_init(&sort_ctx.schema, rs->col_types, rs->num_cols);
+      sort_ctx.col = sort_col;
+      sort_ctx.type = rs->col_types[sort_col];
+      sort_ctx.ascending = qb->sort_ascending;
+
       sort_entry_t* entries = (sort_entry_t*)malloc((size_t)rs->row_count * sizeof(sort_entry_t));
       if (entries) {
-        row_schema_t sort_schema;
-        row_schema_init(&sort_schema, rs->col_types, rs->num_cols);
-
         for (int i = 0; i < rs->row_count; i++) {
-          i32 col_len;
-          const void* col_data = row_extract_column(&sort_schema, sort_col,
-                                                      rs->row_data[i], (i32)rs->row_lens[i], &col_len);
-          if (col_data && col_len > 0) {
-            kanbudb_col_type_t st = rs->col_types[sort_col];
-            if (st == KANBUDB_STRING) {
-              char buf[9] = {0};
-              memcpy(buf, col_data, col_len > 8 ? 8 : (i32)col_len);
-              f64 h = 0;
-              for (int j = 0; j < 8 && buf[j]; j++) h = h * 31 + buf[j];
-              entries[i].key = h;
-            } else if (st == KANBUDB_INT32 || st == KANBUDB_INT64 || st == KANBUDB_BOOL) {
-              entries[i].key = (f64)(st == KANBUDB_INT32 ? *(const i32*)col_data :
-                                      st == KANBUDB_INT64 ? (f64)*(const i64*)col_data :
-                                      (f64)*(const u8*)col_data);
-            } else {
-              entries[i].key = st == KANBUDB_FLOAT ? (f64)*(const f32*)col_data : *(const f64*)col_data;
-            }
-          } else {
-            entries[i].key = 0;
-          }
           entries[i].idx = i;
         }
-
-        if (qb->sort_ascending) {
-          qsort(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp_asc);
-        } else {
-          qsort(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp_desc);
-        }
+        qsort(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp);
 
         void** sorted_data = (void**)malloc((size_t)rs->row_count * sizeof(void*));
         size_t* sorted_lens = (size_t*)malloc((size_t)rs->row_count * sizeof(size_t));
@@ -600,8 +601,9 @@ int rs_add_row(result_set_t* rs, const void* data, size_t len) {
   if (rs->row_count >= rs->row_capacity) {
     int new_cap = rs->row_capacity ? rs->row_capacity * 2 : 64;
     void** new_data = (void**)realloc(rs->row_data, (size_t)new_cap * sizeof(void*));
+    if (!new_data) return KANBUDB_ERR_OOM;
     size_t* new_lens = (size_t*)realloc(rs->row_lens, (size_t)new_cap * sizeof(size_t));
-    if (!new_data || !new_lens) return KANBUDB_ERR_OOM;
+    if (!new_lens) return KANBUDB_ERR_OOM;
     rs->row_data = new_data;
     rs->row_lens = new_lens;
     rs->row_capacity = new_cap;
@@ -665,19 +667,15 @@ int rs_get_column(result_set_t* rs, int col, void** data, size_t* len) {
     return KANBUDB_OK;
   }
 
-  if (!rs->is_fts) {
-    size_t col_len;
-    const void* col_data = rs_get_row_column(rs, rs->current, col, &col_len);
-    if (col_data) {
-      *data = (void*)col_data;
-      *len = col_len;
-    } else {
-      *data = NULL;
-      *len = 0;
-    }
-    return KANBUDB_OK;
+  size_t col_len;
+  const void* col_data = rs_get_row_column(rs, rs->current, col, &col_len);
+  if (col_data) {
+    *data = (void*)col_data;
+    *len = col_len;
+  } else {
+    *data = NULL;
+    *len = 0;
   }
-
   return KANBUDB_OK;
 }
 
