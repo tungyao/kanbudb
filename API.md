@@ -198,19 +198,24 @@ int db_fts_drop_index(db_t *db, const char *table, const char *column);
 ## Architecture (data flow)
 
 ```
-写入:
+写入 (持有写锁):
   db_put() → WAL append → LSM memtable
                           ↓ memtable full?
                     flush → SSTable → 加载到 B-tree
 
 启动恢复:
-  db_open() → 扫描 *.sst → 加载到 B-tree → wal_replay → 就绪
+  db_open() → 扫描 *.sst → 加载到 B-tree → wal_replay → 初始化 rwlock → 就绪
 
-关闭:
-  db_close() → flush memtable → 保存 schema → checkpoint → 截断 WAL
+关闭 (持有写锁):
+  db_close() → flush memtable → 保存 schema → checkpoint → 截断 WAL → 销毁 rwlock
 
-读取:
+读取 (持有读锁):
   db_get() → LSM memtable (最快) → B-tree (后备)
+
+并发模型:
+  db_t.rwlock (pthread_rwlock_t)
+  ├── 读操作: rdlock  → 读读并发
+  └── 写操作: wrlock  → 写串行化, 读写互斥
 
 持久化文件:
   <path>.wal       — WAL (崩溃恢复, flush 后截断)
@@ -260,9 +265,50 @@ make amalgamate
 # → dist/kanbudb.h + dist/kanbudb.c
 ```
 
+## Thread Safety (v0.2.2+)
+
+KanbuDB uses a **single-writer, multiple-reader** concurrency model via `pthread_rwlock_t`:
+
+| Operation | Lock Type | Notes |
+|-----------|-----------|-------|
+| `db_put` | Write | Serialized with all writes and reads |
+| `db_delete` | Write | Serialized with all writes and reads |
+| `db_create_table` | Write | Serialized with all writes and reads |
+| `db_close` | Write | Waits for all readers to finish |
+| `db_fts_create_index` | Write | Serialized with all writes and reads |
+| `db_fts_drop_index` | Write | Serialized with all writes and reads |
+| `db_get` | Read | Concurrent with other reads |
+| `db_fts_search` | Read | Concurrent with other reads |
+| `qb_exec` | Read | Concurrent with other reads |
+
+**Guarantees:**
+- Multiple threads can call `db_get()` / `qb_exec()` concurrently (read-read concurrency)
+- `db_put()` and `db_delete()` are serialized with each other and with reads
+- `db_close()` waits for all active readers to finish before destroying resources
+- Sort operations are thread-safe (per-query stack-local context via `qsort_r`)
+
+**Limitations:**
+- No transaction isolation or snapshot isolation
+- Value pointers from `db_get` / `rs_get_column` are still invalidated by concurrent writes
+- Requires pthread (Linux, macOS). Not available on Windows.
+
+### Linking
+
+When using the shared or static library, link against pthread:
+
+```bash
+# GCC/Clang
+gcc -o myapp myapp.c -Iinclude -Lbuild -lkanbudb_shared -lpthread
+
+# Or with CMake
+find_package(Threads REQUIRED)
+target_link_libraries(myapp kanbudb_shared Threads::Threads)
+```
+
+---
+
 ## Constraints
 
-- **Single-writer, multi-reader**: No concurrent write locking (v1)
 - **Eventual consistency**: Async writes via WAL + LSM flush
 - **No ACID transactions**: No rollback, no cross-op atomicity
 - **No SQL**: Custom C API only

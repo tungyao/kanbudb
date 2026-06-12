@@ -7,6 +7,7 @@ KanbuDB is an embedded C99 database with ACID-like durability, B+tree/SSTable st
 - **Embedded** — single library, no server process
 - **Durable** — WAL + periodic/always fsync modes
 - **LSM + B+tree** — fast writes via memtable, cold reads via SSTable/B+tree
+- **Thread-safe** — single-writer multiple-reader via pthread rwlock (v0.2.2+)
 - **Fluent query builder** — filter, sort, limit, join
 - **Full-text search** — tokenizer → FST inverted index → BM25 ranking
 - **Multi-language** — Python (ctypes), Node.js (koffi), Go (cgo)

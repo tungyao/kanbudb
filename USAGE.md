@@ -239,7 +239,57 @@ gcc -o example example.c -Iinclude -Lbuild -lkanbudb_static
 
 ---
 
-## 8. 持久化与架构
+## 8. 多线程并发访问
+
+KanbuDB 支持单写多读并发模型（v0.2.2+）：
+
+- **读读并发**：多个线程可以同时调用 `db_get()` 和 `qb_exec()`
+- **写串行化**：`db_put()` / `db_delete()` 与其他写操作互斥
+- **读写互斥**：写操作会等待所有读操作完成
+
+```c
+#include <pthread.h>
+
+// 多个线程可以并发读取
+void* reader(void* arg) {
+    db_t* db = (db_t*)arg;
+    for (int i = 0; i < 1000; i++) {
+        void* val; size_t len;
+        db_get(db, "users", "key1", 4, &val, &len);
+    }
+    return NULL;
+}
+
+// 写操作是串行的
+void* writer(void* arg) {
+    db_t* db = (db_t*)arg;
+    for (int i = 0; i < 1000; i++) {
+        db_put(db, "users", "key2", 4, "data", 4);
+    }
+    return NULL;
+}
+
+// 并发使用
+pthread_t r[4], w[2];
+for (int i = 0; i < 4; i++) pthread_create(&r[i], NULL, reader, db);
+for (int i = 0; i < 2; i++) pthread_create(&w[i], NULL, writer, db);
+for (int i = 0; i < 4; i++) pthread_join(r[i], NULL);
+for (int i = 0; i < 2; i++) pthread_join(w[i], NULL);
+```
+
+编译时需要链接 pthread：
+```bash
+gcc -o myapp myapp.c -Iinclude -Lbuild -lkanbudb_static -lpthread
+```
+
+**注意：**
+- `db_get()` 返回的指针在下一次写操作后失效，建议立即拷贝
+- `db_close()` 会等待所有活跃读操作完成后再销毁资源
+- 不支持事务回滚或快照隔离
+
+---
+
+## 9. 持久化与架构
 
 ### 持久化文件
 
