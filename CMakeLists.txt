@@ -17,6 +17,7 @@ set(KANBUDB_SOURCES
   src/storage/sstable.c
   src/core/db.c
   src/query/query_builder.c
+  src/query/row_format.c
   src/fts/tokenizer.c
   src/fts/index.c
   src/fts/parser.c
