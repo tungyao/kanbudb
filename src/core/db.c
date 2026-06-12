@@ -395,6 +395,8 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
   db->fts_index = fts_index_create();
   if (!db->fts_index) { btree_destroy(db->btree); lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return KANBUDB_ERR_OOM; }
 
+  pthread_rwlock_init(&db->rwlock, NULL);
+
   db->num_tables = 0;
   db->last_error = KANBUDB_OK;
 
@@ -451,6 +453,8 @@ int db_close(db_t* db) {
   if (!db) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
 
+  pthread_rwlock_wrlock(&internal->rwlock);
+
   /* Flush any remaining data in memtable */
   if (lsm_has_data(internal->lsm)) {
     db_flush_memtable(internal);
@@ -480,6 +484,9 @@ int db_close(db_t* db) {
   lsm_destroy(internal->lsm);
   wal_destroy(internal->wal);
   free(internal->path);
+
+  pthread_rwlock_unlock(&internal->rwlock);
+  pthread_rwlock_destroy(&internal->rwlock);
   free(internal);
   return KANBUDB_OK;
 }
@@ -511,14 +518,17 @@ int db_create_table(db_t* db, const char* table_name,
   }
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_wrlock(&internal->rwlock);
 
   if (find_table(internal, table_name) >= 0) {
     internal->last_error = KANBUDB_ERR_EXISTS;
+    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_ERR_EXISTS;
   }
 
   if (internal->num_tables >= KANBUDB_MAX_TABLES) {
     internal->last_error = KANBUDB_ERR_OOM;
+    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_ERR_OOM;
   }
 
@@ -531,18 +541,18 @@ int db_create_table(db_t* db, const char* table_name,
   t->num_cols = num_columns;
 
   t->col_types = (kanbudb_col_type_t*)malloc((size_t)num_columns * sizeof(kanbudb_col_type_t));
-  if (!t->col_types) { internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM; }
+  if (!t->col_types) { internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
   memcpy(t->col_types, col_types, (size_t)num_columns * sizeof(kanbudb_col_type_t));
 
   t->col_names = (char**)malloc((size_t)num_columns * sizeof(char*));
-  if (!t->col_names) { free(t->col_types); internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM; }
+  if (!t->col_names) { free(t->col_types); internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
 
   for (int i = 0; i < num_columns; i++) {
     t->col_names[i] = strdup(col_names[i]);
     if (!t->col_names[i]) {
       for (int j = 0; j < i; j++) free(t->col_names[j]);
       free(t->col_names); free(t->col_types);
-      internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM;
+      internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM;
     }
   }
 
@@ -563,6 +573,7 @@ int db_create_table(db_t* db, const char* table_name,
   db_save_schema(internal);
 
   internal->last_error = KANBUDB_OK;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
@@ -571,24 +582,43 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
   if (!db || !table || !key) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_wrlock(&internal->rwlock);
+
   int idx = find_table(internal, table);
-  if (idx < 0) { internal->last_error = KANBUDB_ERR_NOTFOUND; return KANBUDB_ERR_NOTFOUND; }
+  if (idx < 0) {
+    internal->last_error = KANBUDB_ERR_NOTFOUND;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_ERR_NOTFOUND;
+  }
 
   int rc = wal_append(internal->wal, KANBUDB_WAL_PUT,
                        internal->tables[idx].id,
                        key, key_len, value, value_len);
-  if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
+  if (rc != KANBUDB_OK) {
+    internal->last_error = rc;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+  }
 
   rc = lsm_put(internal->lsm, internal->tables[idx].id,
                 key, key_len, value, value_len);
-  if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
+  if (rc != KANBUDB_OK) {
+    internal->last_error = rc;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+  }
 
   if (lsm_is_full(internal->lsm)) {
     int frc = db_flush_memtable(internal);
-    if (frc != KANBUDB_OK) { internal->last_error = frc; return frc; }
+    if (frc != KANBUDB_OK) {
+      internal->last_error = frc;
+      pthread_rwlock_unlock(&internal->rwlock);
+      return frc;
+    }
   }
 
   internal->last_error = KANBUDB_OK;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
@@ -597,17 +627,32 @@ int db_get(db_t* db, const char* table, const char* key, size_t key_len,
   if (!db || !table || !key || !value || !value_len) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_rdlock(&internal->rwlock);
+
   int idx = find_table(internal, table);
-  if (idx < 0) { internal->last_error = KANBUDB_ERR_NOTFOUND; return KANBUDB_ERR_NOTFOUND; }
+  if (idx < 0) {
+    internal->last_error = KANBUDB_ERR_NOTFOUND;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_ERR_NOTFOUND;
+  }
 
   int rc = lsm_get(internal->lsm, internal->tables[idx].id,
                     key, key_len, value, value_len);
-  if (rc == KANBUDB_OK) { internal->last_error = KANBUDB_OK; return KANBUDB_OK; }
+  if (rc == KANBUDB_OK) {
+    internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
+  }
 
   rc = btree_get(internal->btree, key, key_len, value, value_len);
-  if (rc == KANBUDB_OK) { internal->last_error = KANBUDB_OK; return KANBUDB_OK; }
+  if (rc == KANBUDB_OK) {
+    internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
+  }
 
   internal->last_error = KANBUDB_ERR_NOTFOUND;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_ERR_NOTFOUND;
 }
 
@@ -615,23 +660,42 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
   if (!db || !table || !key) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_wrlock(&internal->rwlock);
+
   int idx = find_table(internal, table);
-  if (idx < 0) { internal->last_error = KANBUDB_ERR_NOTFOUND; return KANBUDB_ERR_NOTFOUND; }
+  if (idx < 0) {
+    internal->last_error = KANBUDB_ERR_NOTFOUND;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_ERR_NOTFOUND;
+  }
 
   int rc = wal_append(internal->wal, KANBUDB_WAL_DELETE,
                        internal->tables[idx].id,
                        key, key_len, NULL, 0);
-  if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
+  if (rc != KANBUDB_OK) {
+    internal->last_error = rc;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+  }
 
   rc = lsm_delete(internal->lsm, internal->tables[idx].id, key, key_len);
-  if (rc != KANBUDB_OK) { internal->last_error = rc; return rc; }
+  if (rc != KANBUDB_OK) {
+    internal->last_error = rc;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+  }
 
   if (lsm_is_full(internal->lsm)) {
     int frc = db_flush_memtable(internal);
-    if (frc != KANBUDB_OK) { internal->last_error = frc; return frc; }
+    if (frc != KANBUDB_OK) {
+      internal->last_error = frc;
+      pthread_rwlock_unlock(&internal->rwlock);
+      return frc;
+    }
   }
 
   internal->last_error = KANBUDB_OK;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
@@ -640,18 +704,23 @@ int db_fts_create_index(db_t* db, const char* table, const char* column,
   (void)opts;
   if (!db || !table || !column) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_wrlock(&internal->rwlock);
   if (find_table(internal, table) < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
+    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_ERR_NOTFOUND;
   }
   internal->last_error = KANBUDB_OK;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
 int db_fts_drop_index(db_t* db, const char* table, const char* column) {
   if (!db || !table || !column) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_wrlock(&internal->rwlock);
   internal->last_error = KANBUDB_OK;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
@@ -659,14 +728,17 @@ int db_fts_search(db_t* db, const char* table, const char* column,
                   const char* query, result_set_t** out) {
   if (!db || !table || !column || !query || !out) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+  pthread_rwlock_rdlock(&internal->rwlock);
 
   if (find_table(internal, table) < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
+    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_ERR_NOTFOUND;
   }
 
   if (!internal->fts_index) {
     internal->last_error = KANBUDB_ERR_INVAL;
+    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_ERR_INVAL;
   }
 
@@ -674,6 +746,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   int num_nodes = fts_query_parse(query, nodes, 64);
   if (num_nodes <= 0) {
     internal->last_error = KANBUDB_ERR_INVAL;
+    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_ERR_INVAL;
   }
 
@@ -705,7 +778,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   }
 
   result_set_t* rs = (result_set_t*)calloc(1, sizeof(*rs));
-  if (!rs) { internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM; }
+  if (!rs) { internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
 
   rs->is_fts = 1;
   rs->num_rows = num_doc_ids;
@@ -720,7 +793,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
     rs->scores = (double*)calloc((size_t)num_doc_ids, sizeof(double));
     if (!rs->doc_ids || !rs->scores) {
       free(rs->doc_ids); free(rs->scores); free(rs);
-      internal->last_error = KANBUDB_ERR_OOM; return KANBUDB_ERR_OOM;
+      internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM;
     }
     memcpy(rs->doc_ids, doc_id_buf, (size_t)num_doc_ids * sizeof(uint64_t));
   } else {
@@ -731,5 +804,6 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   rs->current = -1;
   *out = rs;
   internal->last_error = KANBUDB_OK;
+  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }

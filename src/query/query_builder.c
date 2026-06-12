@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "query_builder.h"
 #include "db.h"
 #include "macros.h"
@@ -290,33 +291,32 @@ typedef struct {
   int              ascending;
 } sort_ctx_t;
 
-static sort_ctx_t sort_ctx;
-
-static int sort_entry_cmp(const void* a, const void* b) {
+static int sort_entry_cmp(const void* a, const void* b, void* ctx) {
+  sort_ctx_t* sctx = (sort_ctx_t*)ctx;
   const sort_entry_t* ea = (const sort_entry_t*)a;
   const sort_entry_t* eb = (const sort_entry_t*)b;
   i32 len_a, len_b;
-  const void* da = row_extract_column(&sort_ctx.schema, sort_ctx.col,
-                                       sort_ctx.row_data[ea->idx],
-                                       (i32)sort_ctx.row_lens[ea->idx], &len_a);
-  const void* db = row_extract_column(&sort_ctx.schema, sort_ctx.col,
-                                       sort_ctx.row_data[eb->idx],
-                                       (i32)sort_ctx.row_lens[eb->idx], &len_b);
+  const void* da = row_extract_column(&sctx->schema, sctx->col,
+                                       sctx->row_data[ea->idx],
+                                       (i32)sctx->row_lens[ea->idx], &len_a);
+  const void* db = row_extract_column(&sctx->schema, sctx->col,
+                                       sctx->row_data[eb->idx],
+                                       (i32)sctx->row_lens[eb->idx], &len_b);
   int cmp = 0;
-  if (sort_ctx.type == KANBUDB_STRING) {
+  if (sctx->type == KANBUDB_STRING) {
     size_t min = (size_t)(len_a < len_b ? len_a : len_b);
     cmp = memcmp(da, db, min);
     if (cmp == 0) cmp = (len_a < len_b) ? -1 : (len_a > len_b) ? 1 : 0;
-  } else if (sort_ctx.type == KANBUDB_INT32 || sort_ctx.type == KANBUDB_INT64 || sort_ctx.type == KANBUDB_BOOL) {
-    i64 va = sort_ctx.type == KANBUDB_INT32 ? *(const i32*)da : sort_ctx.type == KANBUDB_INT64 ? *(const i64*)da : *(const u8*)da;
-    i64 vb = sort_ctx.type == KANBUDB_INT32 ? *(const i32*)db : sort_ctx.type == KANBUDB_INT64 ? *(const i64*)db : *(const u8*)db;
+  } else if (sctx->type == KANBUDB_INT32 || sctx->type == KANBUDB_INT64 || sctx->type == KANBUDB_BOOL) {
+    i64 va = sctx->type == KANBUDB_INT32 ? *(const i32*)da : sctx->type == KANBUDB_INT64 ? *(const i64*)da : *(const u8*)da;
+    i64 vb = sctx->type == KANBUDB_INT32 ? *(const i32*)db : sctx->type == KANBUDB_INT64 ? *(const i64*)db : *(const u8*)db;
     if (va < vb) cmp = -1; else if (va > vb) cmp = 1;
   } else {
-    f64 va = sort_ctx.type == KANBUDB_FLOAT ? *(const f32*)da : *(const f64*)da;
-    f64 vb = sort_ctx.type == KANBUDB_FLOAT ? *(const f32*)db : *(const f64*)db;
+    f64 va = sctx->type == KANBUDB_FLOAT ? *(const f32*)da : *(const f64*)da;
+    f64 vb = sctx->type == KANBUDB_FLOAT ? *(const f32*)db : *(const f64*)db;
     if (va < vb) cmp = -1; else if (va > vb) cmp = 1;
   }
-  return sort_ctx.ascending ? cmp : -cmp;
+  return sctx->ascending ? cmp : -cmp;
 }
 
 result_set_t* qb_exec(query_builder_t* qb) {
@@ -419,19 +419,20 @@ result_set_t* qb_exec(query_builder_t* qb) {
       }
     }
     if (sort_col >= 0) {
-      sort_ctx.row_data = (const void**)rs->row_data;
-      sort_ctx.row_lens = rs->row_lens;
-      row_schema_init(&sort_ctx.schema, rs->col_types, rs->num_cols);
-      sort_ctx.col = sort_col;
-      sort_ctx.type = rs->col_types[sort_col];
-      sort_ctx.ascending = qb->sort_ascending;
+      sort_ctx_t sort_ctx_local;
+      sort_ctx_local.row_data = (const void**)rs->row_data;
+      sort_ctx_local.row_lens = rs->row_lens;
+      row_schema_init(&sort_ctx_local.schema, rs->col_types, rs->num_cols);
+      sort_ctx_local.col = sort_col;
+      sort_ctx_local.type = rs->col_types[sort_col];
+      sort_ctx_local.ascending = qb->sort_ascending;
 
       sort_entry_t* entries = (sort_entry_t*)malloc((size_t)rs->row_count * sizeof(sort_entry_t));
       if (entries) {
         for (int i = 0; i < rs->row_count; i++) {
           entries[i].idx = i;
         }
-        qsort(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp);
+        qsort_r(entries, (size_t)rs->row_count, sizeof(sort_entry_t), sort_entry_cmp, &sort_ctx_local);
 
         void** sorted_data = (void**)malloc((size_t)rs->row_count * sizeof(void*));
         size_t* sorted_lens = (size_t*)malloc((size_t)rs->row_count * sizeof(size_t));

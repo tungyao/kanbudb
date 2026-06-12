@@ -12,8 +12,8 @@
 /* ── CRC32 (table-driven) ────────────────────────────────── */
 
 static uint32_t crc32_table[256];
-static int      crc32_table_init = 0;
 
+__attribute__((constructor))
 static void crc32_init_table(void) {
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t crc = i;
@@ -25,11 +25,9 @@ static void crc32_init_table(void) {
         }
         crc32_table[i] = crc;
     }
-    crc32_table_init = 1;
 }
 
 static uint32_t crc32_bytes(const void* data, size_t len, uint32_t crc) {
-    if (!crc32_table_init) crc32_init_table();
     const uint8_t* buf = (const uint8_t*)data;
     crc = ~crc;
     for (size_t i = 0; i < len; i++) {

@@ -30,6 +30,10 @@ target_include_directories(kanbudb_static PUBLIC include src/util src/storage sr
 add_library(kanbudb_shared SHARED ${KANBUDB_SOURCES})
 target_include_directories(kanbudb_shared PUBLIC include src/util src/storage src)
 
+find_package(Threads REQUIRED)
+target_link_libraries(kanbudb_static PRIVATE Threads::Threads)
+target_link_libraries(kanbudb_shared PRIVATE Threads::Threads)
+
 if(KANBUDB_BUILD_TESTS)
   enable_testing()
   add_executable(test_arena test/unit/test_arena.c)
@@ -106,6 +110,11 @@ if(KANBUDB_BUILD_TESTS)
   target_include_directories(test_e2e PRIVATE src)
   target_link_libraries(test_e2e kanbudb_static)
   add_test(NAME test_e2e COMMAND test_e2e)
+
+  add_executable(test_thread_safety test/unit/test_thread_safety.c)
+  target_include_directories(test_thread_safety PRIVATE src/util src/storage src)
+  target_link_libraries(test_thread_safety kanbudb_static Threads::Threads)
+  add_test(NAME test_thread_safety COMMAND test_thread_safety)
 
   add_executable(bench_basic test/bench/bench_basic.c)
   target_include_directories(bench_basic PRIVATE src)

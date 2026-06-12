@@ -17,6 +17,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Extract version from tag
+        id: version
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set version in pyproject.toml
+        run: sed -i 's/^version = .*/version = "${{ steps.version.outputs.v }}"/' pyproject.toml
+
       - name: Build wheels (linux x86_64)
         uses: pypa/cibuildwheel@v2.22
         env:
@@ -46,6 +53,14 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Extract version from tag
+        id: version
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set version in package.json
+        working-directory: bindings/node
+        run: npm version ${{ steps.version.outputs.v }} --no-git-tag-version
 
       - name: Build shared library
         run: |

@@ -3,6 +3,7 @@
 
 #include <macros.h>
 #include <db.h>
+#include <pthread.h>
 #include "fts/index.h"
 
 #define KANBUDB_MAX_TABLES 64
@@ -30,6 +31,7 @@ struct kanbudb_db {
   db_config_t          config;
   int                  last_error;
   kanbudb_fts_index_t*  fts_index;
+  pthread_rwlock_t     rwlock;
 };
 
 #endif /* KANBUDB_CORE_DB_H */
