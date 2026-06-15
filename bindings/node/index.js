@@ -42,6 +42,22 @@ const PTR_FTSOPTS = koffi.pointer(koffi.struct('fts_options_t', {
   language: STR,
 }));
 
+const PTR_VECPARAMS = koffi.pointer(koffi.struct('kanbudb_vec_params_t', {
+  algo: INT,
+  metric: INT,
+  dimension: koffi.types.uint32,
+  initial_capacity: koffi.types.uint32,
+  enable_persistence: INT,
+  M: koffi.types.uint32,
+  ef_construction: koffi.types.uint32,
+  ef_search: koffi.types.uint32,
+}));
+
+const PTR_VECRESULT = koffi.pointer(koffi.struct('kanbudb_vec_result_t', {
+  id: koffi.types.uint64,
+  distance: koffi.types.float,
+}));
+
 const ERR_CODES = {
   0: 'ok', '-1': 'out of memory', '-2': 'not found', '-3': 'already exists',
   '-4': 'corrupt data', '-5': 'I/O error', '-6': 'invalid argument', '-7': 'busy',
@@ -93,6 +109,17 @@ const rs_close = lib.func('rs_close', koffi.types.void, [PTR_VOID]);
 const db_fts_index = lib.func('db_fts_create_index', INT, [PTR_VOID, STR, STR, PTR_FTSOPTS]);
 const db_fts_search = lib.func('db_fts_search', INT, [PTR_VOID, STR, STR, STR, OUT_PTR_VOID]);
 const db_fts_drop = lib.func('db_fts_drop_index', INT, [PTR_VOID, STR, STR]);
+
+// ── Vector function bindings ────────────────────────────────────────
+
+const vec_create = lib.func('kanbudb_vec_create', INT, [STR, PTR_VECPARAMS, OUT_PTR_VOID]);
+const vec_open = lib.func('kanbudb_vec_open', INT, [STR, OUT_PTR_VOID]);
+const vec_close = lib.func('kanbudb_vec_close', INT, [PTR_VOID]);
+const vec_insert = lib.func('kanbudb_vec_insert', INT, [PTR_VOID, koffi.types.uint64, koffi.pointer(koffi.types.float)]);
+const vec_delete = lib.func('kanbudb_vec_delete', INT, [PTR_VOID, koffi.types.uint64]);
+const vec_search = lib.func('kanbudb_vec_search', INT, [PTR_VOID, koffi.pointer(koffi.types.float), koffi.types.uint32, PTR_VECRESULT]);
+const vec_count = lib.func('kanbudb_vec_count', INT, [PTR_VOID]);
+const vec_dimension = lib.func('kanbudb_vec_dimension', INT, [PTR_VOID]);
 
 const qb_cond = lib.func('qb_cond', PTR_VOID, [PTR_VOID, STR, STR, PTR_VOID]);
 const qb_cond_and = lib.func('qb_cond_and', PTR_VOID, [PTR_VOID, PTR_VOID, PTR_VOID]);
@@ -309,6 +336,67 @@ class Database {
   ftsDropIndex(table, column) {
     const rc = db_fts_drop(this.ptr, table, column);
     check(rc);
+  }
+
+  // ── Vector Index ─────────────────────────────────────────────────
+
+  vecCreate(path, params) {
+    const vp = {
+      algo: { flat: 0, hnsw: 1 }[params.algo || 'flat'] ?? 0,
+      metric: { l2: 0, cosine: 1, ip: 2 }[params.metric || 'l2'] ?? 0,
+      dimension: params.dimension || 0,
+      initial_capacity: params.initialCapacity || 0,
+      enable_persistence: path ? 1 : 0,
+      M: params.M || 16,
+      ef_construction: params.efConstruction || 200,
+      ef_search: params.efSearch || 50,
+    };
+    const ptrOut = allocBuf(8);
+    const rc = vec_create(path, vp, ptrOut);
+    check(rc);
+    return decodePtr(ptrOut);
+  }
+
+  vecOpen(path) {
+    const ptrOut = allocBuf(8);
+    const rc = vec_open(path, ptrOut);
+    check(rc);
+    return decodePtr(ptrOut);
+  }
+
+  vecClose(handle) {
+    const rc = vec_close(handle);
+    check(rc);
+  }
+
+  vecInsert(handle, id, floatBuf) {
+    const rc = vec_insert(handle, BigInt(id), floatBuf);
+    check(rc);
+  }
+
+  vecDelete(handle, id) {
+    const rc = vec_delete(handle, BigInt(id));
+    check(rc);
+  }
+
+  vecSearch(handle, queryBuf, k) {
+    const results = new koffi.StructResultBuffer('kanbudb_vec_result_t', k);
+    const n = vec_search(handle, queryBuf, k, results);
+    if (n < 0) throw new KanbuDBError(n);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const r = results.get(i);
+      out.push({ id: Number(r.id), distance: r.distance });
+    }
+    return out;
+  }
+
+  vecCount(handle) {
+    return vec_count(handle);
+  }
+
+  vecDimension(handle) {
+    return vec_dimension(handle);
   }
 
   close() {

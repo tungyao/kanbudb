@@ -51,6 +51,31 @@ class _FtsOptions(ctypes.Structure):
         ("language", ctypes.c_char_p),
     ]
 
+class _VecParams(ctypes.Structure):
+    _fields_ = [
+        ("algo", ctypes.c_int),
+        ("metric", ctypes.c_int),
+        ("dimension", ctypes.c_uint32),
+        ("initial_capacity", ctypes.c_uint32),
+        ("enable_persistence", ctypes.c_int),
+        ("M", ctypes.c_uint32),
+        ("ef_construction", ctypes.c_uint32),
+        ("ef_search", ctypes.c_uint32),
+    ]
+
+class _VecResult(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("distance", ctypes.c_float),
+    ]
+
+VEC_ALGO_FLAT = 0
+VEC_ALGO_HNSW = 1
+
+VEC_METRIC_L2 = 0
+VEC_METRIC_COSINE = 1
+VEC_METRIC_IP = 2
+
 # ── Error codes ──────────────────────────────────────────────────────
 
 KANBUDB_OK = 0
@@ -165,6 +190,37 @@ _lib.qb_cond_not.restype = ctypes.c_void_p
 
 _lib.qb_where.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _lib.qb_where.restype = ctypes.c_int
+
+# ── Vector function signatures ───────────────────────────────────────
+
+_lib.kanbudb_vec_create.argtypes = [
+    ctypes.c_char_p, ctypes.POINTER(_VecParams), ctypes.POINTER(ctypes.c_void_p),
+]
+_lib.kanbudb_vec_create.restype = ctypes.c_int
+
+_lib.kanbudb_vec_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+_lib.kanbudb_vec_open.restype = ctypes.c_int
+
+_lib.kanbudb_vec_close.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_vec_close.restype = ctypes.c_int
+
+_lib.kanbudb_vec_insert.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+_lib.kanbudb_vec_insert.restype = ctypes.c_int
+
+_lib.kanbudb_vec_delete.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+_lib.kanbudb_vec_delete.restype = ctypes.c_int
+
+_lib.kanbudb_vec_search.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.POINTER(_VecResult),
+]
+_lib.kanbudb_vec_search.restype = ctypes.c_int
+
+_lib.kanbudb_vec_count.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_vec_count.restype = ctypes.c_int
+
+_lib.kanbudb_vec_dimension.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_vec_dimension.restype = ctypes.c_int
 
 
 # ── High-level Python API ────────────────────────────────────────────
@@ -398,6 +454,96 @@ class Database:
     def fts_drop_index(self, table: str, column: str):
         rc = _lib.db_fts_drop_index(self._ptr, table.encode(), column.encode())
         _check(rc)
+
+    # ── Vector Index ──────────────────────────────────────────────
+
+    def vec_create(self, path: str, params: dict) -> int:
+        """Create a vector index.
+
+        Args:
+            path: File path for the index (or None for in-memory).
+            params: dict with keys:
+                - metric: "l2", "cosine", or "ip"
+                - dimension: int
+                - algo: "flat" or "hnsw" (optional, default "flat")
+                - initial_capacity: int (optional)
+                - M: int (HNSW, optional)
+                - ef_construction: int (HNSW, optional)
+                - ef_search: int (HNSW, optional)
+
+        Returns:
+            Opaque index handle (int pointer value).
+        """
+        metric_map = {"l2": VEC_METRIC_L2, "cosine": VEC_METRIC_COSINE, "ip": VEC_METRIC_IP}
+        algo_map = {"flat": VEC_ALGO_FLAT, "hnsw": VEC_ALGO_HNSW}
+        vp = _VecParams(
+            algo=algo_map.get(params.get("algo", "flat"), VEC_ALGO_FLAT),
+            metric=metric_map.get(params.get("metric", "l2"), VEC_METRIC_L2),
+            dimension=params.get("dimension", 0),
+            initial_capacity=params.get("initial_capacity", 0),
+            enable_persistence=1 if path else 0,
+            M=params.get("M", 16),
+            ef_construction=params.get("ef_construction", 200),
+            ef_search=params.get("ef_search", 50),
+        )
+        out = ctypes.c_void_p()
+        rc = _lib.kanbudb_vec_create(
+            path.encode() if path else None, ctypes.byref(vp), ctypes.byref(out)
+        )
+        _check(rc)
+        return out.value
+
+    def vec_open(self, path: str) -> int:
+        """Open an existing vector index from disk."""
+        out = ctypes.c_void_p()
+        rc = _lib.kanbudb_vec_open(path.encode(), ctypes.byref(out))
+        _check(rc)
+        return out.value
+
+    def vec_close(self, idx: int):
+        """Close a vector index handle."""
+        _check(_lib.kanbudb_vec_close(ctypes.c_void_p(idx)))
+
+    def vec_insert(self, idx: int, vid: int, vector: list):
+        """Insert a vector into the index.
+
+        Args:
+            idx: Index handle from vec_create/vec_open.
+            vid: Unique 64-bit ID for the vector.
+            vector: List of floats (length must match dimension).
+        """
+        arr = (ctypes.c_float * len(vector))(*vector)
+        _check(_lib.kanbudb_vec_insert(ctypes.c_void_p(idx), ctypes.c_uint64(vid), arr))
+
+    def vec_delete(self, idx: int, vid: int):
+        """Delete a vector by ID."""
+        _check(_lib.kanbudb_vec_delete(ctypes.c_void_p(idx), ctypes.c_uint64(vid)))
+
+    def vec_search(self, idx: int, query: list, k: int = 10):
+        """Search for nearest neighbors.
+
+        Args:
+            idx: Index handle.
+            query: List of floats (query vector).
+            k: Number of nearest neighbors to return.
+
+        Returns:
+            List of (id, distance) tuples, sorted by distance ascending.
+        """
+        qarr = (ctypes.c_float * len(query))(*query)
+        results = (_VecResult * k)()
+        n = _lib.kanbudb_vec_search(ctypes.c_void_p(idx), qarr, ctypes.c_uint32(k), results)
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
+
+    def vec_count(self, idx: int) -> int:
+        """Return the number of vectors in the index."""
+        return _lib.kanbudb_vec_count(ctypes.c_void_p(idx))
+
+    def vec_dimension(self, idx: int) -> int:
+        """Return the dimension of vectors in the index."""
+        return _lib.kanbudb_vec_dimension(ctypes.c_void_p(idx))
 
     # ── Lifecycle ─────────────────────────────────────────────────
 

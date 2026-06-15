@@ -18,6 +18,7 @@ package kanbudb
 #cgo CFLAGS: -I${SRCDIR}/../../include -I${SRCDIR}/../../src -I${SRCDIR}/../../src/util
 
 #include "db.h"
+#include "vector.h"
 #include <stdlib.h>
 */
 import "C"
@@ -396,6 +397,134 @@ func (db *Database) FtsDropIndex(table, column string) error {
 
 	rc := C.db_fts_drop_index(db.ptr, C.CString(table), C.CString(column))
 	return kanbudbError(rc)
+}
+
+/* Vector index types */
+
+type VecAlgo int
+
+const (
+	VecAlgoFlat VecAlgo = C.KANBUDB_VEC_ALGO_FLAT
+	VecAlgoHNSW VecAlgo = C.KANBUDB_VEC_ALGO_HNSW
+)
+
+type VecMetric int
+
+const (
+	VecMetricL2     VecMetric = C.KANBUDB_VEC_METRIC_L2
+	VecMetricCosine VecMetric = C.KANBUDB_VEC_METRIC_COSINE
+	VecMetricIP     VecMetric = C.KANBUDB_VEC_METRIC_IP
+)
+
+type VecParams struct {
+	Algo            VecAlgo
+	Metric          VecMetric
+	Dimension       int
+	InitialCapacity int
+	EnablePersistence bool
+	M               int
+	EfConstruction  int
+	EfSearch        int
+}
+
+type VecSearchResult struct {
+	ID       uint64
+	Distance float32
+}
+
+func (db *Database) VecCreate(path string, params VecParams) (unsafe.Pointer, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	persist := 0
+	if params.EnablePersistence {
+		persist = 1
+	}
+
+	cparams := C.kanbudb_vec_params_t{
+		algo:              C.kanbudb_vec_algo_t(params.Algo),
+		metric:            C.kanbudb_vec_metric_t(params.Metric),
+		dimension:         C.uint32_t(params.Dimension),
+		initial_capacity:  C.uint32_t(params.InitialCapacity),
+		enable_persistence: C.int(persist),
+		M:                 C.uint32_t(params.M),
+		ef_construction:   C.uint32_t(params.EfConstruction),
+		ef_search:         C.uint32_t(params.EfSearch),
+	}
+
+	var out *C.kanbudb_vec_index_t
+	rc := C.kanbudb_vec_create(cpath, &cparams, &out)
+	if rc != 0 {
+		return nil, kanbudbError(rc)
+	}
+	return unsafe.Pointer(out), nil
+}
+
+func (db *Database) VecOpen(path string) (unsafe.Pointer, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	var out *C.kanbudb_vec_index_t
+	rc := C.kanbudb_vec_open(cpath, &out)
+	if rc != 0 {
+		return nil, kanbudbError(rc)
+	}
+	return unsafe.Pointer(out), nil
+}
+
+func (db *Database) VecClose(idx unsafe.Pointer) error {
+	rc := C.kanbudb_vec_close((*C.kanbudb_vec_index_t)(idx))
+	return kanbudbError(rc)
+}
+
+func (db *Database) VecInsert(idx unsafe.Pointer, id uint64, vec []float32) error {
+	if len(vec) == 0 {
+		return &Err{Code: -6, Msg: "empty vector"}
+	}
+	rc := C.kanbudb_vec_insert(
+		(*C.kanbudb_vec_index_t)(idx),
+		C.uint64_t(id),
+		(*C.float)(unsafe.Pointer(&vec[0])),
+	)
+	return kanbudbError(rc)
+}
+
+func (db *Database) VecDelete(idx unsafe.Pointer, id uint64) error {
+	rc := C.kanbudb_vec_delete((*C.kanbudb_vec_index_t)(idx), C.uint64_t(id))
+	return kanbudbError(rc)
+}
+
+func (db *Database) VecSearch(idx unsafe.Pointer, query []float32, k int) ([]VecSearchResult, error) {
+	if len(query) == 0 {
+		return nil, &Err{Code: -6, Msg: "empty query"}
+	}
+	cresults := make([]C.kanbudb_vec_result_t, k)
+	rc := C.kanbudb_vec_search(
+		(*C.kanbudb_vec_index_t)(idx),
+		(*C.float)(unsafe.Pointer(&query[0])),
+		C.uint32_t(k),
+		&cresults[0],
+	)
+	if rc < 0 {
+		return nil, kanbudbError(rc)
+	}
+	n := int(rc)
+	out := make([]VecSearchResult, n)
+	for i := 0; i < n; i++ {
+		out[i] = VecSearchResult{
+			ID:       uint64(cresults[i].id),
+			Distance: float32(cresults[i].distance),
+		}
+	}
+	return out, nil
+}
+
+func (db *Database) VecCount(idx unsafe.Pointer) int {
+	return int(C.kanbudb_vec_count((*C.kanbudb_vec_index_t)(idx)))
+}
+
+func (db *Database) VecDimension(idx unsafe.Pointer) int {
+	return int(C.kanbudb_vec_dimension((*C.kanbudb_vec_index_t)(idx)))
 }
 
 func b2c(b bool) C.int {

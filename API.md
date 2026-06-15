@@ -4,7 +4,7 @@
 
 - Language: C99
 - Build: CMake
-- Header: `include/db.h`
+- Header: `include/db.h` (core), `include/vector.h` (vector search)
 - Single-file dist: `dist/kanbudb.h` + `dist/kanbudb.c` (via `make amalgamate`)
 - Link: `-lkanbudb_static` or `-lkanbudb_shared`
 - License: MIT
@@ -39,6 +39,48 @@ typedef struct {
   size_t              memtable_size;     // default: 4MB
   int                 compaction_threads; // default: 1
 } db_config_t;
+
+// Vector search types (include/vector.h)
+typedef enum {
+  KANBUDB_VEC_ALGO_FLAT = 0,   // Brute-force linear scan
+  KANBUDB_VEC_ALGO_HNSW = 1    // Hierarchical Navigable Small World
+} kanbudb_vec_algo_t;
+
+typedef enum {
+  KANBUDB_VEC_METRIC_L2     = 0,  // Euclidean (squared)
+  KANBUDB_VEC_METRIC_COSINE = 1,  // Cosine (1 - dot, vectors must be normalized)
+  KANBUDB_VEC_METRIC_IP     = 2   // Inner product (-dot for min-heap)
+} kanbudb_vec_metric_t;
+
+typedef struct {
+  kanbudb_vec_algo_t  algo;
+  kanbudb_vec_metric_t metric;
+  uint32_t            dimension;          // Must be > 0
+  uint32_t            initial_capacity;
+  int                 enable_persistence;
+  uint32_t            M;                  // HNSW max connections (default 16)
+  uint32_t            ef_construction;    // HNSW build width (default 200)
+  uint32_t            ef_search;          // HNSW query width (default 50)
+} kanbudb_vec_params_t;
+
+#define KANBUDB_VEC_PARAMS_DEFAULT \
+  { .algo = KANBUDB_VEC_ALGO_FLAT, .metric = KANBUDB_VEC_METRIC_L2, \
+    .dimension = 0, .initial_capacity = 0, .enable_persistence = 0, \
+    .M = 16, .ef_construction = 200, .ef_search = 50 }
+
+typedef struct kanbudb_vec_index kanbudb_vec_index_t;  // Opaque handle
+
+typedef struct {
+  uint64_t id;
+  float    distance;
+} kanbudb_vec_result_t;
+
+typedef struct {
+  uint64_t count;
+  uint64_t capacity;
+  uint64_t memory_bytes;
+  uint32_t dimension;
+} kanbudb_vec_stats_t;
 
 // FTS index options
 typedef struct {
@@ -193,6 +235,78 @@ int db_fts_search(db_t *db, const char *table, const char *column,
 int db_fts_drop_index(db_t *db, const char *table, const char *column);
 ```
 
+### Vector Search
+
+```c
+// Create a vector index. path may be NULL for memory-only.
+// params.dimension must be > 0.
+// Returns 0 on success, negative on error.
+int kanbudb_vec_create(const char *path, const kanbudb_vec_params_t *params,
+                       kanbudb_vec_index_t **out);
+
+// Open an existing persisted vector index.
+int kanbudb_vec_open(const char *path, kanbudb_vec_index_t **out);
+
+// Close and free vector index. Auto-flushes if persistent.
+int kanbudb_vec_close(kanbudb_vec_index_t *idx);
+
+// Flush to disk (write snapshot + truncate WAL).
+int kanbudb_vec_flush(kanbudb_vec_index_t *idx);
+
+// Set background auto-flush interval (ms). 0 = disable.
+int kanbudb_vec_flush_interval(kanbudb_vec_index_t *idx, int interval_ms);
+
+// Destroy all files at path.
+int kanbudb_vec_destroy(const char *path);
+
+// Insert or update a vector. id is user-defined (64-bit).
+// vector must have dimension floats.
+int kanbudb_vec_insert(kanbudb_vec_index_t *idx, uint64_t id,
+                       const float *vector);
+
+// Batch insert. FLAT: O(1) copy. HNSW: inserted one by one.
+int kanbudb_vec_insert_batch(kanbudb_vec_index_t *idx, uint32_t count,
+                             const uint64_t *ids, const float *vectors);
+
+// Soft-delete a vector. Returns KANBUDB_VEC_ERR_NOTFOUND if missing.
+int kanbudb_vec_delete(kanbudb_vec_index_t *idx, uint64_t id);
+
+// Top-K ANN search. results must have space for k entries.
+// Returns number of results found.
+int kanbudb_vec_search(kanbudb_vec_index_t *idx, const float *query,
+                       uint32_t k, kanbudb_vec_result_t *results);
+
+// Radius search (distance <= radius).
+int kanbudb_vec_search_radius(kanbudb_vec_index_t *idx,
+                              const float *query, float radius,
+                              kanbudb_vec_result_t *results,
+                              uint32_t max_results);
+
+// Get raw vector by ID. Returns KANBUDB_VEC_ERR_NOTFOUND if missing.
+int kanbudb_vec_get(kanbudb_vec_index_t *idx, uint64_t id,
+                    float *out_vector);
+
+// Return vector count.
+int kanbudb_vec_count(kanbudb_vec_index_t *idx);
+
+// Return vector dimension.
+int kanbudb_vec_dimension(kanbudb_vec_index_t *idx);
+
+// Return statistics (count, capacity, memory, dimension).
+int kanbudb_vec_stats(kanbudb_vec_index_t *idx, kanbudb_vec_stats_t *stats);
+```
+
+**Vector error codes:**
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `KANBUDB_VEC_OK` | 0 | Success |
+| `KANBUDB_VEC_ERR_OOM` | -1 | Out of memory |
+| `KANBUDB_VEC_ERR_NOTFOUND` | -2 | ID not found |
+| `KANBUDB_VEC_ERR_CORRUPT` | -3 | Corrupt data |
+| `KANBUDB_VEC_ERR_IO` | -4 | I/O error |
+| `KANBUDB_VEC_ERR_INVAL` | -5 | Invalid argument |
+
 ---
 
 ## Architecture (data flow)
@@ -242,6 +356,10 @@ int db_fts_drop_index(db_t *db, const char *table, const char *column);
 | FTS Parser | `src/fts/parser.{h,c}` | Lucene-like query syntax parser |
 | FTS Ranker | `src/fts/ranker.{h,c}` | BM25 scoring |
 | Query Builder | `src/query/query_builder.{h,c}` | Fluent query API + result set |
+| Vector Index | `src/vector/vector.{c,h}` | Public API + FLAT/HNSW dispatch + WAL integration |
+| HNSW Graph | `src/vector/hnsw.{c,h}` | Hierarchical NSW ANN algorithm |
+| Distance | `src/vector/distance.{c,h}` | L2/Cosine/IP + SIMD (AVX2/NEON) |
+| Vector Persistence | `src/vector/persistence.{c,h}` | WAL + snapshot + recovery |
 | Core DB | `src/core/db.{c,h}` | Orchestration, table metadata |
 
 ## Test commands
@@ -280,6 +398,11 @@ KanbuDB uses a **single-writer, multiple-reader** concurrency model via `pthread
 | `db_get` | Read | Concurrent with other reads |
 | `db_fts_search` | Read | Concurrent with other reads |
 | `qb_exec` | Read | Concurrent with other reads |
+| `kanbudb_vec_insert` | Write | Serialized with all vector writes and reads |
+| `kanbudb_vec_delete` | Write | Serialized with all vector writes and reads |
+| `kanbudb_vec_flush` | Write | Serialized with all vector writes and reads |
+| `kanbudb_vec_search` | Read | Concurrent with other vector reads |
+| `kanbudb_vec_get` / `kanbudb_vec_count` | Read | Concurrent with other vector reads |
 
 **Guarantees:**
 - Multiple threads can call `db_get()` / `qb_exec()` concurrently (read-read concurrency)

@@ -22,13 +22,17 @@ set(KANBUDB_SOURCES
   src/fts/index.c
   src/fts/parser.c
   src/fts/ranker.c
+  src/vector/vector.c
+  src/vector/distance.c
+  src/vector/persistence.c
+  src/vector/hnsw.c
 )
 
 add_library(kanbudb_static STATIC ${KANBUDB_SOURCES})
-target_include_directories(kanbudb_static PUBLIC include src/util src/storage src)
+target_include_directories(kanbudb_static PUBLIC include src/util src/storage src src/vector)
 
 add_library(kanbudb_shared SHARED ${KANBUDB_SOURCES})
-target_include_directories(kanbudb_shared PUBLIC include src/util src/storage src)
+target_include_directories(kanbudb_shared PUBLIC include src/util src/storage src src/vector)
 
 find_package(Threads REQUIRED)
 target_link_libraries(kanbudb_static PRIVATE Threads::Threads)
@@ -116,6 +120,20 @@ if(KANBUDB_BUILD_TESTS)
   target_link_libraries(test_thread_safety kanbudb_static Threads::Threads)
   add_test(NAME test_thread_safety COMMAND test_thread_safety)
 
+  add_executable(test_vector test/unit/test_vector.c)
+  target_include_directories(test_vector PRIVATE src/vector)
+  target_link_libraries(test_vector kanbudb_static m)
+  add_test(NAME test_vector COMMAND test_vector)
+
+  add_executable(test_hnsw test/unit/test_hnsw.c)
+  target_include_directories(test_hnsw PRIVATE src/vector)
+  target_link_libraries(test_hnsw kanbudb_static m)
+  add_test(NAME test_hnsw COMMAND test_hnsw)
+
+  add_executable(bench_vector test/bench/bench_vector.c)
+  target_include_directories(bench_vector PRIVATE src/vector)
+  target_link_libraries(bench_vector kanbudb_static m)
+
   add_executable(bench_basic test/bench/bench_basic.c)
   target_include_directories(bench_basic PRIVATE src)
   target_link_libraries(bench_basic kanbudb_static)
@@ -123,6 +141,10 @@ if(KANBUDB_BUILD_TESTS)
   add_executable(bench_persist test/bench/bench_persist.c)
   target_include_directories(bench_persist PRIVATE src src/storage)
   target_link_libraries(bench_persist kanbudb_static)
+
+  add_executable(bench_thread_safety test/bench/bench_thread_safety.c)
+  target_include_directories(bench_thread_safety PRIVATE src/vector)
+  target_link_libraries(bench_thread_safety kanbudb_static Threads::Threads m)
 endif()
 
 add_custom_target(amalgamate
