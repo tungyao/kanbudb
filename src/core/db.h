@@ -5,6 +5,7 @@
 #include <db.h>
 #include <pthread.h>
 #include "fts/index.h"
+#include "vector.h"
 
 #define KANBUDB_MAX_TABLES 64
 
@@ -31,6 +32,8 @@ struct kanbudb_db {
   db_config_t          config;
   int                  last_error;
   kanbudb_fts_index_t*  fts_index;
+  kanbudb_vec_index_t*  vec_index;
+  kanbudb_embed_t*      embed;
   pthread_rwlock_t     rwlock;
 };
 

@@ -26,6 +26,7 @@ set(KANBUDB_SOURCES
   src/vector/distance.c
   src/vector/persistence.c
   src/vector/hnsw.c
+  src/vector/embedding.c
 )
 
 add_library(kanbudb_static STATIC ${KANBUDB_SOURCES})
@@ -35,8 +36,8 @@ add_library(kanbudb_shared SHARED ${KANBUDB_SOURCES})
 target_include_directories(kanbudb_shared PUBLIC include src/util src/storage src src/vector)
 
 find_package(Threads REQUIRED)
-target_link_libraries(kanbudb_static PRIVATE Threads::Threads)
-target_link_libraries(kanbudb_shared PRIVATE Threads::Threads)
+target_link_libraries(kanbudb_static PRIVATE Threads::Threads m)
+target_link_libraries(kanbudb_shared PRIVATE Threads::Threads m)
 
 if(KANBUDB_BUILD_TESTS)
   enable_testing()
@@ -129,6 +130,11 @@ if(KANBUDB_BUILD_TESTS)
   target_include_directories(test_hnsw PRIVATE src/vector)
   target_link_libraries(test_hnsw kanbudb_static m)
   add_test(NAME test_hnsw COMMAND test_hnsw)
+
+  add_executable(test_embed test/unit/test_embed.c)
+  target_include_directories(test_embed PRIVATE src/vector src)
+  target_link_libraries(test_embed kanbudb_static m)
+  add_test(NAME test_embed COMMAND test_embed)
 
   add_executable(bench_vector test/bench/bench_vector.c)
   target_include_directories(bench_vector PRIVATE src/vector)

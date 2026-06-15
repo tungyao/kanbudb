@@ -526,12 +526,124 @@ int main(void) {
 编译运行：
 ```bash
 gcc -o example example.c -Iinclude -Lbuild -lkanbudb_static -lpthread -lm
-./example
 ```
 
 ---
 
-## 10. 持久化与架构
+## 10. 内置 Embedding + DB 向量搜索
+
+KanbuDB 内置了轻量级文本嵌入引擎（基于 n-gram hash + random projection），无需外部模型即可将文本直接转为向量并存入向量索引。同时提供了 `db_vec_*` 系列 API，将向量索引挂载到 `db_t` 上，使用更方便。
+
+### 基本用法
+
+```c
+#include "db.h"
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    db_t *db;
+    db_config_t cfg = { 0 };
+    db_open("/tmp/mydb", &cfg, &db);
+
+    // 创建向量索引 + 内置 embedding (128维, 3-gram)
+    db_vec_options_t opts = KANBUDB_VEC_OPTIONS_DEFAULT;
+    opts.dimension = 128;
+    opts.ngram_size = 3;
+    db_vec_create_index(db, &opts);
+
+    // 文本直接插入 — embedding 自动完成
+    db_vec_insert_text(db, 1, "the quick brown fox jumps over lazy dog", 39);
+    db_vec_insert_text(db, 2, "database performance optimization techniques", 43);
+    db_vec_insert_text(db, 3, "machine learning model training guide", 37);
+
+    // 文本搜索 — query 自动 embedding 后做 ANN 搜索
+    kanbudb_vec_result_t results[10];
+    int n = db_vec_search_text(db, "fast database query", 19, 10, results);
+    printf("Found %d similar documents:\n", n);
+    for (int i = 0; i < n; i++)
+        printf("  id=%llu  distance=%.4f\n",
+               (unsigned long long)results[i].id, results[i].distance);
+
+    db_close(db);
+    return 0;
+}
+```
+
+### 也可以插入原始向量
+
+```c
+float vec[128] = { /* ... */ };
+db_vec_insert_vector(db, 100, vec);
+
+kanbudb_vec_result_t results[5];
+db_vec_search(db, query_vec, 5, results);
+```
+
+### 批量插入
+
+```c
+uint64_t ids[] = { 1, 2, 3 };
+const char *texts[] = { "hello world", "foo bar", "baz qux" };
+size_t lens[] = { 11, 7, 7 };
+db_vec_insert_batch(db, 3, ids, texts, lens);
+```
+
+### 自定义 Embedding
+
+如果内置 embedding 不满足需求，可以用 `db_vec_set_embed()` 注入外部 embedding 函数：
+
+```c
+kanbudb_embed_t *my_embed = NULL;
+kanbudb_embed_create(768, 4, &my_embed);  // 768维, 4-gram
+db_vec_set_embed(db, my_embed);  // 后续 insert_text/search_text 使用此 embedding
+```
+
+### DB Vector API 总览
+
+| 函数 | 作用 |
+|------|------|
+| `db_vec_create_index` | 创建向量索引 + embedding |
+| `db_vec_destroy_index` | 销毁向量索引 |
+| `db_vec_insert_text` | 文本自动 embedding 后插入 |
+| `db_vec_insert_batch` | 批量文本插入 |
+| `db_vec_insert_vector` | 直接插入原始浮点向量 |
+| `db_vec_search_text` | 文本自动 embedding 后搜索 |
+| `db_vec_search` | 原始向量搜索 |
+| `db_vec_delete` | 删除向量 |
+| `db_vec_count` | 返回向量数量 |
+| `db_vec_flush` | 手动持久化 |
+| `db_vec_set_embed` | 注入自定义 embedding |
+
+### HNSW 模式
+
+```c
+db_vec_options_t opts = KANBUDB_VEC_OPTIONS_DEFAULT;
+opts.dimension = 128;
+opts.enable_hnsw = 1;       // 启用 HNSW 加速搜索
+opts.hnsw_m = 16;           // HNSW M 参数
+opts.hnsw_ef_construction = 200;
+db_vec_create_index(db, &opts);
+```
+
+### Embedding 算法说明
+
+内置 embedding 基于 **n-gram hash + random projection**：
+1. 将文本切分为字符级 n-gram（默认 3-gram）
+2. 每个 n-gram 通过 FNV-1a 哈希映射到随机投影矩阵的对应行
+3. 累加所有 n-gram 的投影向量
+4. L2 归一化为单位向量
+
+特点：
+- **确定性**：相同输入始终产生相同向量
+- **无外部依赖**：纯 C 实现，不需要模型文件或 API
+- **轻量级**：内存占用约 `dimensions × 256 × 4` 字节的投影矩阵
+- **适合场景**：快速原型、短文本近似匹配、关键词级语义聚类
+- **不适合场景**：需要高质量语义理解（建议使用外部 embedding API + `db_vec_insert_vector`）
+
+---
+
+## 11. 持久化与架构
 
 ### 持久化文件
 
@@ -574,10 +686,12 @@ kanbudb_vec_open:
 ┌──────────────────────────────────────────────┐
 │              Public C API                    │
 │  db_open / db_put / db_get / db_query / fts │
-│  + vec_create / vec_insert / vec_search     │
+│  + db_vec_create_index / db_vec_insert_text  │
+│  + db_vec_search_text / vec_insert / search  │
 ├────────────────┬─────────────────────────────┤
 │   Core DB      │    Query Builder    Vector  │
 │  (table mgmt)  │   (fluent API)     Index    │
+│  + vec_index   │                  + Embed    │
 ├────────┬───────┴──┬──────────────────────────┤
 │  WAL   │   LSM    │       B+tree    HNSW 图  │
 │(crash  │(memtable │    (cold store,  (层级     │
@@ -587,6 +701,9 @@ kanbudb_vec_open:
 ├──────────────────────────────────────────────┤
 │           FTS 引擎                            │
 │   Tokenizer → Index → Parser → Ranker        │
+├──────────────────────────────────────────────┤
+│        内置 Embedding 引擎                    │
+│   n-gram Hash → Random Projection → L2 Norm  │
 ├──────────────────────────────────────────────┤
 │          Util 层                              │
 │   Arena / Page Cache / FST / BM25 / Distance │
@@ -601,3 +718,4 @@ kanbudb_vec_open:
 - FTS 路径: `文本 → tokenizer → 倒排索引 (FST) → BM25`
 - **向量搜索路径: `vec_insert → WAL → 索引图` / `vec_search → 图遍历 → Top-K`**
 - **向量持久化路径: `vec_flush → 快照 → meta+vectors+ids` / `vec_open → 加载 + WAL replay`**
+- **Embedding 路径: `db_vec_insert_text → n-gram hash → random projection → vec_insert`**

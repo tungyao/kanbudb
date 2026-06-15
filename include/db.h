@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "macros.h"
+#include "vector.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -101,6 +102,39 @@ int db_fts_search(db_t *db, const char *table, const char *column,
 int db_fts_create_index(db_t *db, const char *table, const char *column,
                         const fts_options_t *opts);
 int db_fts_drop_index(db_t *db, const char *table, const char *column);
+
+/* Vector index + built-in embedding */
+typedef struct kanbudb_vec_index kanbudb_vec_index_t;
+typedef struct kanbudb_embed kanbudb_embed_t;
+
+typedef struct {
+    uint32_t dimension;
+    uint32_t ngram_size;
+    int      enable_hnsw;
+    uint32_t hnsw_m;
+    uint32_t hnsw_ef_construction;
+} db_vec_options_t;
+
+#define KANBUDB_VEC_OPTIONS_DEFAULT \
+    { .dimension = 128, .ngram_size = 3, .enable_hnsw = 0, \
+      .hnsw_m = 16, .hnsw_ef_construction = 200 }
+
+int db_vec_create_index(db_t *db, const db_vec_options_t *opts);
+int db_vec_destroy_index(db_t *db);
+int db_vec_insert_text(db_t *db, uint64_t id,
+                       const char *text, size_t text_len);
+int db_vec_insert_batch(db_t *db, uint32_t count,
+                        const uint64_t *ids,
+                        const char **texts, const size_t *text_lens);
+int db_vec_insert_vector(db_t *db, uint64_t id, const float *vector);
+int db_vec_search_text(db_t *db, const char *text, size_t text_len,
+                       uint32_t k, kanbudb_vec_result_t *results);
+int db_vec_search(db_t *db, const float *query,
+                  uint32_t k, kanbudb_vec_result_t *results);
+int db_vec_delete(db_t *db, uint64_t id);
+int db_vec_count(db_t *db);
+int db_vec_flush(db_t *db);
+int db_vec_set_embed(db_t *db, kanbudb_embed_t *embed);
 
 #ifdef __cplusplus
 }

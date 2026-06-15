@@ -10,6 +10,8 @@
 #include "fts/index.h"
 #include "fts/tokenizer.h"
 #include "fts/parser.h"
+#include "vector.h"
+#include "embedding.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -480,6 +482,8 @@ int db_close(db_t* db) {
   }
 
   if (internal->fts_index) fts_index_destroy(internal->fts_index);
+  if (internal->vec_index) kanbudb_vec_close(internal->vec_index);
+  if (internal->embed) kanbudb_embed_destroy(internal->embed);
   btree_destroy(internal->btree);
   lsm_destroy(internal->lsm);
   wal_destroy(internal->wal);
@@ -806,4 +810,210 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   internal->last_error = KANBUDB_OK;
   pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
+}
+
+/* ── Vector index + built-in embedding ─────────────────────── */
+
+int db_vec_create_index(db_t* db, const db_vec_options_t* opts)
+{
+    if (!db || !opts || opts->dimension == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+
+    if (internal->vec_index) {
+        kanbudb_vec_close(internal->vec_index);
+        internal->vec_index = NULL;
+    }
+    if (internal->embed) {
+        kanbudb_embed_destroy(internal->embed);
+        internal->embed = NULL;
+    }
+
+    kanbudb_vec_params_t vparams = KANBUDB_VEC_PARAMS_DEFAULT;
+    vparams.dimension = opts->dimension;
+    if (opts->enable_hnsw) {
+        vparams.algo = KANBUDB_VEC_ALGO_HNSW;
+        vparams.M = opts->hnsw_m;
+        vparams.ef_construction = opts->hnsw_ef_construction;
+    }
+
+    char vec_path[512];
+    snprintf(vec_path, sizeof(vec_path), "%s.vec", internal->path);
+    int rc = kanbudb_vec_create(vec_path, &vparams, &internal->vec_index);
+    if (rc != KANBUDB_VEC_OK) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return rc;
+    }
+
+    rc = kanbudb_embed_create(opts->dimension,
+                              opts->ngram_size ? opts->ngram_size : 3,
+                              &internal->embed);
+
+    internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_destroy_index(db_t* db)
+{
+    if (!db) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+
+    if (internal->vec_index) {
+        kanbudb_vec_close(internal->vec_index);
+        internal->vec_index = NULL;
+    }
+    if (internal->embed) {
+        kanbudb_embed_destroy(internal->embed);
+        internal->embed = NULL;
+    }
+
+    internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
+}
+
+int db_vec_insert_text(db_t* db, uint64_t id,
+                       const char* text, size_t text_len)
+{
+    if (!db || !text) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index || !internal->embed) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    uint32_t dim = kanbudb_embed_dimensions(internal->embed);
+    float* vec = (float*)malloc((size_t)dim * sizeof(float));
+    if (!vec) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    int rc = kanbudb_embed_text(internal->embed, text, text_len, vec);
+    if (rc == 0)
+        rc = kanbudb_vec_insert(internal->vec_index, id, vec);
+    free(vec);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_insert_batch(db_t* db, uint32_t count,
+                        const uint64_t* ids,
+                        const char** texts, const size_t* text_lens)
+{
+    if (!db || !ids || !texts || !text_lens || count == 0)
+        return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index || !internal->embed) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    uint32_t dim = kanbudb_embed_dimensions(internal->embed);
+    float* vecs = (float*)malloc((size_t)count * dim * sizeof(float));
+    if (!vecs) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    int rc = kanbudb_embed_batch(internal->embed, texts, text_lens, count, vecs);
+    if (rc == 0)
+        rc = kanbudb_vec_insert_batch(internal->vec_index, count, ids, vecs);
+    free(vecs);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_insert_vector(db_t* db, uint64_t id, const float* vector)
+{
+    if (!db || !vector) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    int rc = kanbudb_vec_insert(internal->vec_index, id, vector);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_search_text(db_t* db, const char* text, size_t text_len,
+                       uint32_t k, kanbudb_vec_result_t* results)
+{
+    if (!db || !text || !results || k == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index || !internal->embed) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    uint32_t dim = kanbudb_embed_dimensions(internal->embed);
+    float* qvec = (float*)malloc((size_t)dim * sizeof(float));
+    if (!qvec) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    int rc = kanbudb_embed_text(internal->embed, text, text_len, qvec);
+    if (rc == 0)
+        rc = kanbudb_vec_search(internal->vec_index, qvec, k, results);
+    free(qvec);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_search(db_t* db, const float* query,
+                  uint32_t k, kanbudb_vec_result_t* results)
+{
+    if (!db || !query || !results || k == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    int rc = kanbudb_vec_search(internal->vec_index, query, k, results);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_delete(db_t* db, uint64_t id)
+{
+    if (!db) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    int rc = kanbudb_vec_delete(internal->vec_index, id);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_count(db_t* db)
+{
+    if (!db) return 0;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    int c = internal->vec_index ? kanbudb_vec_count(internal->vec_index) : 0;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return c;
+}
+
+int db_vec_flush(db_t* db)
+{
+    if (!db) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    int rc = kanbudb_vec_flush(internal->vec_index);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_set_embed(db_t* db, kanbudb_embed_t* embed)
+{
+    if (!db || !embed) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+    if (internal->embed) kanbudb_embed_destroy(internal->embed);
+    internal->embed = embed;
+    internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
 }

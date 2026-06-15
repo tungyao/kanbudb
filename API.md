@@ -4,7 +4,7 @@
 
 - Language: C99
 - Build: CMake
-- Header: `include/db.h` (core), `include/vector.h` (vector search)
+- Header: `include/db.h` (core), `include/vector.h` (vector search + embedding)
 - Single-file dist: `dist/kanbudb.h` + `dist/kanbudb.c` (via `make amalgamate`)
 - Link: `-lkanbudb_static` or `-lkanbudb_shared`
 - License: MIT
@@ -296,6 +296,88 @@ int kanbudb_vec_dimension(kanbudb_vec_index_t *idx);
 int kanbudb_vec_stats(kanbudb_vec_index_t *idx, kanbudb_vec_stats_t *stats);
 ```
 
+### Built-in Text Embedding
+
+```c
+// Create an embedding engine. ngram_size defaults to 3 if 0.
+// dimensions: output vector size. ngram_size: character n-gram width.
+int kanbudb_embed_create(uint32_t dimensions, uint32_t ngram_size,
+                         kanbudb_embed_t **out);
+
+// Free embedding engine.
+void kanbudb_embed_destroy(kanbudb_embed_t *embed);
+
+// Embed text into a float vector. out_vector must have dimensions floats.
+// Returns 0 on success. Result is L2-normalized.
+int kanbudb_embed_text(const kanbudb_embed_t *embed,
+                       const char *text, size_t text_len,
+                       float *out_vector);
+
+// Batch embed multiple texts. out_vectors: count × dimensions floats.
+int kanbudb_embed_batch(const kanbudb_embed_t *embed,
+                        const char **texts, const size_t *text_lens,
+                        uint32_t count, float *out_vectors);
+
+// Return the dimension of the embedding.
+uint32_t kanbudb_embed_dimensions(const kanbudb_embed_t *embed);
+```
+
+### DB-level Vector + Embedding API
+
+```c
+// Options for db_vec_create_index.
+typedef struct {
+    uint32_t dimension;            // Vector dimension (required, > 0)
+    uint32_t ngram_size;           // Embedding n-gram size (0 = default 3)
+    int      enable_hnsw;          // 0 = FLAT, 1 = HNSW
+    uint32_t hnsw_m;               // HNSW M param (default 16)
+    uint32_t hnsw_ef_construction; // HNSW ef_construction (default 200)
+} db_vec_options_t;
+
+#define KANBUDB_VEC_OPTIONS_DEFAULT \
+    { .dimension = 128, .ngram_size = 3, .enable_hnsw = 0, \
+      .hnsw_m = 16, .hnsw_ef_construction = 200 }
+
+// Create vector index + embedding engine on the database.
+// Stores vector index at <db_path>.vec/
+int db_vec_create_index(db_t *db, const db_vec_options_t *opts);
+
+// Destroy vector index and embedding engine.
+int db_vec_destroy_index(db_t *db);
+
+// Insert text — auto-embeds and stores in vector index.
+int db_vec_insert_text(db_t *db, uint64_t id,
+                       const char *text, size_t text_len);
+
+// Batch insert texts.
+int db_vec_insert_batch(db_t *db, uint32_t count,
+                        const uint64_t *ids,
+                        const char **texts, const size_t *text_lens);
+
+// Insert a pre-computed vector directly.
+int db_vec_insert_vector(db_t *db, uint64_t id, const float *vector);
+
+// Search by text — auto-embeds query and performs ANN search.
+int db_vec_search_text(db_t *db, const char *text, size_t text_len,
+                       uint32_t k, kanbudb_vec_result_t *results);
+
+// Search by raw vector.
+int db_vec_search(db_t *db, const float *query,
+                  uint32_t k, kanbudb_vec_result_t *results);
+
+// Delete a vector by ID.
+int db_vec_delete(db_t *db, uint64_t id);
+
+// Return vector count in the index.
+int db_vec_count(db_t *db);
+
+// Flush vector index to disk.
+int db_vec_flush(db_t *db);
+
+// Replace the embedding engine (e.g. for custom embedding).
+int db_vec_set_embed(db_t *db, kanbudb_embed_t *embed);
+```
+
 **Vector error codes:**
 
 | Constant | Value | Meaning |
@@ -337,6 +419,11 @@ int kanbudb_vec_stats(kanbudb_vec_index_t *idx, kanbudb_vec_stats_t *stats);
   <path>.ckpt.N    — B-tree 检查点
   <path>.system    — 表 schema
   <path>.seq       — SSTable 序列号
+
+Embedding 路径:
+  db_vec_insert_text → kanbudb_embed_text (n-gram hash + random projection)
+                    → kanbudb_vec_insert
+  db_vec_search_text → kanbudb_embed_text → kanbudb_vec_search
 ```
 
 ## Internal modules
@@ -360,6 +447,7 @@ int kanbudb_vec_stats(kanbudb_vec_index_t *idx, kanbudb_vec_stats_t *stats);
 | HNSW Graph | `src/vector/hnsw.{c,h}` | Hierarchical NSW ANN algorithm |
 | Distance | `src/vector/distance.{c,h}` | L2/Cosine/IP + SIMD (AVX2/NEON) |
 | Vector Persistence | `src/vector/persistence.{c,h}` | WAL + snapshot + recovery |
+| Text Embedding | `src/vector/embedding.{c,h}` | n-gram hash + random projection |
 | Core DB | `src/core/db.{c,h}` | Orchestration, table metadata |
 
 ## Test commands
@@ -403,6 +491,11 @@ KanbuDB uses a **single-writer, multiple-reader** concurrency model via `pthread
 | `kanbudb_vec_flush` | Write | Serialized with all vector writes and reads |
 | `kanbudb_vec_search` | Read | Concurrent with other vector reads |
 | `kanbudb_vec_get` / `kanbudb_vec_count` | Read | Concurrent with other vector reads |
+| `db_vec_create_index` | Write | Serialized with all writes |
+| `db_vec_insert_text` | Read (db) + Write (vec) | Reads db rwlock, acquires vec write lock internally |
+| `db_vec_search_text` | Read | Concurrent with other reads |
+| `db_vec_insert_vector` | Read (db) + Write (vec) | Same as insert_text |
+| `db_vec_delete` | Read (db) + Write (vec) | Same as insert_text |
 
 **Guarantees:**
 - Multiple threads can call `db_get()` / `qb_exec()` concurrently (read-read concurrency)
