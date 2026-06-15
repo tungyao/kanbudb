@@ -244,6 +244,11 @@ func (qb *QueryBuilder) Join(table, onLocal, onForeign string) *QueryBuilder {
 	return qb
 }
 
+func (qb *QueryBuilder) Where(cond *Condition) *QueryBuilder {
+	C.qb_where(qb.getPtr(), cond.ptr)
+	return qb
+}
+
 func (qb *QueryBuilder) Exec() (*ResultSet, error) {
 	rs := C.qb_exec(qb.getPtr())
 	if rs == nil {
@@ -291,6 +296,49 @@ func (rs *ResultSet) Close() {
 		C.rs_close(rs.ptr)
 		rs.closed = true
 	}
+}
+
+type Condition struct {
+	ptr *C.qb_condition_t
+}
+
+func NewCondition(column, op string, value interface{}) *Condition {
+	ccol := C.CString(column)
+	defer C.free(unsafe.Pointer(ccol))
+	cop := C.CString(op)
+	defer C.free(unsafe.Pointer(cop))
+	v := fmt.Sprintf("%v", value)
+	cv := C.CString(v)
+	defer C.free(unsafe.Pointer(cv))
+	ptr := C.qb_cond(nil, ccol, cop, unsafe.Pointer(cv))
+	if ptr == nil {
+		return nil
+	}
+	return &Condition{ptr: (*C.qb_condition_t)(ptr)}
+}
+
+func CondAnd(left, right *Condition) *Condition {
+	ptr := C.qb_cond_and(nil, left.ptr, right.ptr)
+	if ptr == nil {
+		return nil
+	}
+	return &Condition{ptr: (*C.qb_condition_t)(ptr)}
+}
+
+func CondOr(left, right *Condition) *Condition {
+	ptr := C.qb_cond_or(nil, left.ptr, right.ptr)
+	if ptr == nil {
+		return nil
+	}
+	return &Condition{ptr: (*C.qb_condition_t)(ptr)}
+}
+
+func CondNot(child *Condition) *Condition {
+	ptr := C.qb_cond_not(nil, child.ptr)
+	if ptr == nil {
+		return nil
+	}
+	return &Condition{ptr: (*C.qb_condition_t)(ptr)}
 }
 
 type FtsOptions struct {

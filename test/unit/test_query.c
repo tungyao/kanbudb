@@ -23,7 +23,9 @@ static void cleanup(void) {
   unlink(path);
   snprintf(path, sizeof(path), "%s.system", TEST_DB_PATH);
   unlink(path);
-  for (int i = 0; i < 10; i++) {
+  snprintf(path, sizeof(path), "%s.seq", TEST_DB_PATH);
+  unlink(path);
+  for (int i = 0; i < 256; i++) {
     snprintf(path, sizeof(path), "%s.sst.0.%d", TEST_DB_PATH, i);
     unlink(path);
     snprintf(path, sizeof(path), "%s.ckpt.%d", TEST_DB_PATH, i);
@@ -329,6 +331,163 @@ static int test_from_override(void) {
   return 1;
 }
 
+/* Helper: create a "users" table with id(int32), name(string), age(int32) and insert test data */
+static db_t* setup_users_table(int num_users) {
+  db_t* db = NULL;
+  if (db_open(TEST_DB_PATH, NULL, &db) != KANBUDB_OK) return NULL;
+
+  const char* col_names[] = {"id", "name", "age"};
+  kanbudb_col_type_t col_types[] = {KANBUDB_INT32, KANBUDB_STRING, KANBUDB_INT32};
+  if (db_create_table(db, "users", col_names, col_types, 3, "id") != KANBUDB_OK) {
+    db_close(db); return NULL;
+  }
+
+  /* Users: (1, "alice", 25), (2, "bob", 17), (3, "charlie", 30),
+     (4, "diana", 12), (5, "eve", 22) */
+  const char* names[] = {"alice", "bob", "charlie", "diana", "eve"};
+  i32 ages[] = {25, 17, 30, 12, 22};
+  int n = num_users < 5 ? num_users : 5;
+
+  u8 buf[256];
+  for (int i = 0; i < n; i++) {
+    i32 len = encode_row((i32)(i + 1), names[i], ages[i], buf, sizeof(buf));
+    char key[16]; snprintf(key, sizeof(key), "k%d", i + 1);
+    if (db_put(db, "users", key, strlen(key) + 1, buf, (size_t)len) != KANBUDB_OK) {
+      db_close(db); return NULL;
+    }
+  }
+  return db;
+}
+
+static int count_rows(result_set_t* rs) {
+  int count = 0;
+  while (rs_next(rs)) count++;
+  return count;
+}
+
+static int test_multi_and(void) {
+  cleanup();
+  db_t* db = setup_users_table(5);
+  if (!db) return 0;
+
+  /* WHERE age > 18 AND age < 28 => alice(25), eve(22) = 2 rows */
+  query_builder_t* qb = db_query(db, "users");
+  qb_filter(qb, "age", ">", "18");
+  qb_filter(qb, "age", "<", "28");
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); cleanup(); return 0; }
+  int count = count_rows(rs);
+  rs_close(rs);
+  qb_destroy(qb);
+  db_close(db); cleanup();
+  return count == 2;
+}
+
+static int test_multi_or(void) {
+  cleanup();
+  db_t* db = setup_users_table(5);
+  if (!db) return 0;
+
+  /* WHERE age < 15 OR age > 28 => diana(12), charlie(30) = 2 rows */
+  query_builder_t* qb = db_query(db, "users");
+  qb_condition_t* c1 = qb_cond(qb, "age", "<", "15");
+  qb_condition_t* c2 = qb_cond(qb, "age", ">", "28");
+  qb_condition_t* root = qb_cond_or(qb, c1, c2);
+  qb_where(qb, root);
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); cleanup(); return 0; }
+  int count = count_rows(rs);
+  rs_close(rs);
+  qb_destroy(qb);
+  db_close(db); cleanup();
+  return count == 2;
+}
+
+static int test_nested_and_or(void) {
+  cleanup();
+  db_t* db = setup_users_table(5);
+  if (!db) return 0;
+
+  /* WHERE (age > 20 AND age < 28) OR age < 15
+     => alice(25), eve(22), diana(12) = 3 rows */
+  query_builder_t* qb = db_query(db, "users");
+  qb_condition_t* a = qb_cond(qb, "age", ">", "20");
+  qb_condition_t* b = qb_cond(qb, "age", "<", "28");
+  qb_condition_t* left = qb_cond_and(qb, a, b);
+  qb_condition_t* right = qb_cond(qb, "age", "<", "15");
+  qb_condition_t* root = qb_cond_or(qb, left, right);
+  qb_where(qb, root);
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); cleanup(); return 0; }
+  int count = count_rows(rs);
+  rs_close(rs);
+  qb_destroy(qb);
+  db_close(db); cleanup();
+  return count == 3;
+}
+
+static int test_not(void) {
+  cleanup();
+  db_t* db = setup_users_table(5);
+  if (!db) return 0;
+
+  /* WHERE NOT (age > 20) => bob(17), diana(12) = 2 rows */
+  query_builder_t* qb = db_query(db, "users");
+  qb_condition_t* inner = qb_cond(qb, "age", ">", "20");
+  qb_condition_t* root = qb_cond_not(qb, inner);
+  qb_where(qb, root);
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); cleanup(); return 0; }
+  int count = count_rows(rs);
+  rs_close(rs);
+  qb_destroy(qb);
+  db_close(db); cleanup();
+  return count == 2;
+}
+
+static int test_deep_nesting(void) {
+  cleanup();
+  db_t* db = setup_users_table(5);
+  if (!db) return 0;
+
+  /* WHERE NOT (age > 18 AND (age < 20 OR name = "eve"))
+     age > 18 AND (age < 20 OR name = "eve")
+     => (25: F), (17: F), (30: F), (12: F), (22: name=eve -> T) => only eve matches inner
+     NOT => alice(25), bob(17), charlie(30), diana(12) = 4 rows */
+  query_builder_t* qb = db_query(db, "users");
+  qb_condition_t* age_gt18 = qb_cond(qb, "age", ">", "18");
+  qb_condition_t* age_lt20 = qb_cond(qb, "age", "<", "20");
+  qb_condition_t* name_eve = qb_cond(qb, "name", "=", "eve");
+  qb_condition_t* or_node = qb_cond_or(qb, age_lt20, name_eve);
+  qb_condition_t* and_node = qb_cond_and(qb, age_gt18, or_node);
+  qb_condition_t* root = qb_cond_not(qb, and_node);
+  qb_where(qb, root);
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); cleanup(); return 0; }
+  int count = count_rows(rs);
+  rs_close(rs);
+  qb_destroy(qb);
+  db_close(db); cleanup();
+  return count == 4;
+}
+
+static int test_backward_compat(void) {
+  cleanup();
+  db_t* db = setup_users_table(5);
+  if (!db) return 0;
+
+  /* Old-style qb_filter still works: age > 25 => charlie(30) = 1 row */
+  query_builder_t* qb = db_query(db, "users");
+  qb_filter(qb, "age", ">", "25");
+  result_set_t* rs = qb_exec(qb);
+  if (!rs) { qb_destroy(qb); db_close(db); cleanup(); return 0; }
+  int count = count_rows(rs);
+  rs_close(rs);
+  qb_destroy(qb);
+  db_close(db); cleanup();
+  return count == 1;
+}
+
 int main(void) {
   printf("query builder tests:\n");
   TEST(lifecycle);
@@ -339,6 +498,12 @@ int main(void) {
   TEST(sort);
   TEST(limit);
   TEST(limit_sort);
+  TEST(multi_and);
+  TEST(multi_or);
+  TEST(nested_and_or);
+  TEST(not);
+  TEST(deep_nesting);
+  TEST(backward_compat);
   printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
   return tests_failed > 0 ? 1 : 0;
 }

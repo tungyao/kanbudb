@@ -6,6 +6,33 @@
 
 #define KANBUDB_MAX_COLS 64
 
+/* Condition tree node for multi-condition filters */
+typedef enum {
+  QBCOND_LEAF,
+  QBCOND_AND,
+  QBCOND_OR,
+  QBCOND_NOT
+} qb_cond_type_t;
+
+typedef struct qb_condition_t {
+  qb_cond_type_t type;
+  union {
+    struct {
+      char column[64];
+      char op[16];
+      char value[256];
+      size_t value_len;
+    } leaf;
+    struct {
+      struct qb_condition_t* left;
+      struct qb_condition_t* right;
+    } comb;
+    struct {
+      struct qb_condition_t* child;
+    } neg;
+  } as;
+} qb_condition_t;
+
 struct result_set_t {
   int               num_rows;
   int               current;
@@ -21,6 +48,9 @@ struct result_set_t {
   int               row_capacity;
   int               row_count;
 };
+
+/* Recursively destroy a condition tree */
+void condition_destroy(qb_condition_t* cond);
 
 /* Add a row to result set (copies the data) */
 int rs_add_row(result_set_t* rs, const void* data, size_t len);

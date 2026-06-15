@@ -14,6 +14,7 @@ Usage:
 
 import ctypes
 import os
+import struct
 from typing import Optional, Any
 
 # ── Load shared library ──────────────────────────────────────────────
@@ -150,6 +151,21 @@ _lib.db_fts_search.restype = ctypes.c_int
 _lib.db_fts_drop_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
 _lib.db_fts_drop_index.restype = ctypes.c_int
 
+_lib.qb_cond.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
+_lib.qb_cond.restype = ctypes.c_void_p
+
+_lib.qb_cond_and.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+_lib.qb_cond_and.restype = ctypes.c_void_p
+
+_lib.qb_cond_or.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+_lib.qb_cond_or.restype = ctypes.c_void_p
+
+_lib.qb_cond_not.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_lib.qb_cond_not.restype = ctypes.c_void_p
+
+_lib.qb_where.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_lib.qb_where.restype = ctypes.c_int
+
 
 # ── High-level Python API ────────────────────────────────────────────
 
@@ -219,6 +235,10 @@ class _QueryBuilder:
         _check(_lib.qb_join(self._ptr, table.encode(), on_local.encode(), on_foreign.encode()))
         return self
 
+    def where(self, cond: "Condition") -> "_QueryBuilder":
+        _check(_lib.qb_where(self._ptr, cond._ptr))
+        return self
+
     def exec(self) -> _ResultSet:
         rs_ptr = _lib.qb_exec(self._ptr)
         return _ResultSet(rs_ptr, self._db_ref)
@@ -232,6 +252,49 @@ class _QueryBuilder:
         self.close()
 
 
+class Condition:
+    """Condition tree node for multi-condition filters.
+
+    Supports Python operators:
+        & (AND), | (OR), ~ (NOT)
+
+    Usage:
+        c1 = Condition("age", ">", 18)
+        c2 = Condition("name", "=", "alice")
+        root = c1 & c2          # AND
+        root = c1 | c2          # OR
+        root = ~c1              # NOT
+        db.query("users").where(root).exec()
+    """
+
+    def __init__(self, column: str, op: str, value):
+        v = str(value).encode()
+        self._ptr = ctypes.c_void_p(
+            _lib.qb_cond(None, column.encode(), op.encode(), ctypes.c_char_p(v))
+        )
+
+    @classmethod
+    def _from_ptr(cls, ptr):
+        cond = cls.__new__(cls)
+        cond._ptr = ptr
+        return cond
+
+    def __and__(self, other: "Condition") -> "Condition":
+        return Condition._from_ptr(
+            ctypes.c_void_p(_lib.qb_cond_and(None, self._ptr, other._ptr))
+        )
+
+    def __or__(self, other: "Condition") -> "Condition":
+        return Condition._from_ptr(
+            ctypes.c_void_p(_lib.qb_cond_or(None, self._ptr, other._ptr))
+        )
+
+    def __invert__(self) -> "Condition":
+        return Condition._from_ptr(
+            ctypes.c_void_p(_lib.qb_cond_not(None, self._ptr))
+        )
+
+
 class Database:
     """KanbuDB embedded database handle."""
 
@@ -243,6 +306,7 @@ class Database:
         rc = _lib.db_open(path.encode(), ctypes.byref(cfg), ctypes.byref(self._ptr))
         if rc != KANBUDB_OK:
             raise KanbuDBError(rc)
+        self._table_schemas: dict[str, dict[str, str]] = {}
 
     # ── Schema ────────────────────────────────────────────────────
 
@@ -254,6 +318,34 @@ class Database:
             col_names[i] = cname.encode()
             col_types[i] = COL_TYPES[ctype]
         rc = _lib.db_create_table(self._ptr, name.encode(), col_names, col_types, len(columns), pk.encode())
+        _check(rc)
+        self._table_schemas[name] = dict(columns)
+
+    def put_row(self, table: str, key: str, values: dict[str, Any]):
+        """Put a row with properly encoded column values for query/filter/condition support."""
+        schema = self._table_schemas.get(table)
+        if not schema:
+            raise KanbuDBError(KANBUDB_ERR_INVAL, f"unknown table '{table}'")
+        buf = bytearray()
+        for col_name, col_type_str in schema.items():
+            val = values.get(col_name)
+            ctype = COL_TYPES[col_type_str]
+            if ctype == COL_TYPES["int32"]:
+                buf.extend(struct.pack("<i", int(val)))
+            elif ctype == COL_TYPES["int64"]:
+                buf.extend(struct.pack("<q", int(val)))
+            elif ctype == COL_TYPES["float"]:
+                buf.extend(struct.pack("<f", float(val)))
+            elif ctype == COL_TYPES["double"]:
+                buf.extend(struct.pack("<d", float(val)))
+            elif ctype == COL_TYPES["bool"]:
+                buf.extend(struct.pack("<B", 1 if val else 0))
+            else:
+                s = str(val).encode()
+                buf.extend(struct.pack("<I", len(s)))
+                buf.extend(s)
+        rc = _lib.db_put(self._ptr, table.encode(), key.encode(), len(key),
+                         bytes(buf), len(buf))
         _check(rc)
 
     # ── CRUD ──────────────────────────────────────────────────────

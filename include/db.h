@@ -14,6 +14,7 @@ extern "C" {
 typedef struct kanbudb_db db_t;
 typedef struct query_builder_t query_builder_t;
 typedef struct result_set_t result_set_t;
+typedef struct qb_condition_t qb_condition_t;
 /* Column types */
 typedef enum {
   KANBUDB_INT32,
@@ -76,6 +77,16 @@ int qb_join(query_builder_t *qb, const char *table,
             const char *on_local, const char *on_foreign);
 result_set_t *qb_exec(query_builder_t *qb);
 void qb_destroy(query_builder_t *qb);
+
+/* Condition tree for multi-condition filters */
+qb_condition_t *qb_cond(query_builder_t *qb, const char *column,
+                         const char *op, const void *value);
+qb_condition_t *qb_cond_and(query_builder_t *qb,
+                            qb_condition_t *left, qb_condition_t *right);
+qb_condition_t *qb_cond_or(query_builder_t *qb,
+                           qb_condition_t *left, qb_condition_t *right);
+qb_condition_t *qb_cond_not(query_builder_t *qb, qb_condition_t *child);
+int qb_where(query_builder_t *qb, qb_condition_t *cond);
 
 /* Result set */
 int rs_next(result_set_t *rs);

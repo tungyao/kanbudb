@@ -94,6 +94,12 @@ const db_fts_index = lib.func('db_fts_create_index', INT, [PTR_VOID, STR, STR, P
 const db_fts_search = lib.func('db_fts_search', INT, [PTR_VOID, STR, STR, STR, OUT_PTR_VOID]);
 const db_fts_drop = lib.func('db_fts_drop_index', INT, [PTR_VOID, STR, STR]);
 
+const qb_cond = lib.func('qb_cond', PTR_VOID, [PTR_VOID, STR, STR, PTR_VOID]);
+const qb_cond_and = lib.func('qb_cond_and', PTR_VOID, [PTR_VOID, PTR_VOID, PTR_VOID]);
+const qb_cond_or = lib.func('qb_cond_or', PTR_VOID, [PTR_VOID, PTR_VOID, PTR_VOID]);
+const qb_cond_not = lib.func('qb_cond_not', PTR_VOID, [PTR_VOID, PTR_VOID]);
+const qb_where = lib.func('qb_where', INT, [PTR_VOID, PTR_VOID]);
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 function decodePtr(buf) {
@@ -164,6 +170,36 @@ class ResultSet {
   }
 }
 
+// ── Condition ───────────────────────────────────────────────────
+
+class Condition {
+  constructor(column, op, value) {
+    const valBuf = Buffer.from(String(value) + '\0');
+    this.ptr = qb_cond(null, column, op, valBuf);
+  }
+
+  static and(left, right) {
+    const ptr = qb_cond_and(null, left.ptr, right.ptr);
+    const c = Object.create(Condition.prototype);
+    c.ptr = ptr;
+    return c;
+  }
+
+  static or(left, right) {
+    const ptr = qb_cond_or(null, left.ptr, right.ptr);
+    const c = Object.create(Condition.prototype);
+    c.ptr = ptr;
+    return c;
+  }
+
+  static not(child) {
+    const ptr = qb_cond_not(null, child.ptr);
+    const c = Object.create(Condition.prototype);
+    c.ptr = ptr;
+    return c;
+  }
+}
+
 // ── Database ────────────────────────────────────────────────────
 
 class Database {
@@ -179,6 +215,7 @@ class Database {
     const rc = db_open(path, cfg, ptrOut);
     check(rc);
     this.ptr = decodePtr(ptrOut);
+    this._schemas = {};
   }
 
   createTable(name, columns, pk) {
@@ -187,6 +224,39 @@ class Database {
     const colTypesBuf = allocBuf(colTypes.length * 4);
     for (let i = 0; i < colTypes.length; i++) colTypesBuf.writeInt32LE(colTypes[i], i * 4);
     const rc = db_create_table(this.ptr, name, colNames, colTypesBuf, colNames.length, pk);
+    check(rc);
+    this._schemas[name] = Object.assign({}, columns);
+  }
+
+  putRow(table, key, values) {
+    const schema = this._schemas[table];
+    if (!schema) throw new KanbuDBError(-6, `unknown table '${table}'`);
+
+    const colNames = Object.keys(schema);
+    const parts = [];
+    for (const col of colNames) {
+      const ct = schema[col];
+      const val = values[col];
+      const typeIdx = COL_TYPES[ct];
+      const buf = allocBuf(64);
+      let len = 0;
+      if (typeIdx === 0) { buf.writeInt32LE(Number(val), 0); len = 4; }
+      else if (typeIdx === 1) { buf.writeBigInt64LE(BigInt(val), 0); len = 8; }
+      else if (typeIdx === 2) { buf.writeFloatLE(Number(val), 0); len = 4; }
+      else if (typeIdx === 3) { buf.writeDoubleLE(Number(val), 0); len = 8; }
+      else if (typeIdx === 6) { buf.writeInt8(val ? 1 : 0, 0); len = 1; }
+      else {
+        const s = Buffer.from(String(val), 'utf8');
+        const h = allocBuf(4);
+        h.writeUInt32LE(s.length, 0);
+        parts.push(h);
+        parts.push(s);
+        continue;
+      }
+      parts.push(buf.subarray(0, len));
+    }
+    const rowData = Buffer.concat(parts);
+    const rc = db_put(this.ptr, table, key, Buffer.byteLength(key), rowData, rowData.length);
     check(rc);
   }
 
@@ -278,6 +348,11 @@ class QueryBuilder {
     return this;
   }
 
+  where(cond) {
+    qb_where(this.ptr, cond.ptr);
+    return this;
+  }
+
   exec() {
     const ptr = qb_exec(this.ptr);
     return ptr ? new ResultSet(ptr) : null;
@@ -296,5 +371,6 @@ class QueryBuilder {
 module.exports = {
   open: (path, opts) => new Database(path, opts),
   Database,
+  Condition,
   KanbuDBError,
 };

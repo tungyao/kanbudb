@@ -14,11 +14,7 @@
 struct query_builder_t {
   struct kanbudb_db* db;
   char     table[64];
-  char     filter_column[64];
-  char     filter_op[16];
-  char     filter_value[256];
-  size_t   filter_value_len;
-  int      has_filter;
+  qb_condition_t* root_condition;
   char     sort_column[64];
   int      sort_ascending;
   int      has_sort;
@@ -47,7 +43,7 @@ query_builder_t* db_query(db_t* db, const char* table) {
   qb->table[n] = '\0';
 
   qb->limit = 0;
-  qb->has_filter = 0;
+  qb->root_condition = NULL;
   qb->has_sort = 0;
   qb->has_limit = 0;
   qb->has_join = 0;
@@ -70,20 +66,33 @@ int qb_filter(query_builder_t* qb, const char* column,
               const char* op, const void* value) {
   if (!qb || !column || !op || !value) return KANBUDB_ERR_INVAL;
 
+  qb_condition_t* leaf = (qb_condition_t*)calloc(1, sizeof(*leaf));
+  if (!leaf) return KANBUDB_ERR_OOM;
+
+  leaf->type = QBCOND_LEAF;
   size_t n = strlen(column);
-  if (n >= sizeof(qb->filter_column)) n = sizeof(qb->filter_column) - 1;
-  memcpy(qb->filter_column, column, n);
-  qb->filter_column[n] = '\0';
+  if (n >= sizeof(leaf->as.leaf.column)) n = sizeof(leaf->as.leaf.column) - 1;
+  memcpy(leaf->as.leaf.column, column, n);
+  leaf->as.leaf.column[n] = '\0';
 
   n = strlen(op);
-  if (n >= sizeof(qb->filter_op)) n = sizeof(qb->filter_op) - 1;
-  memcpy(qb->filter_op, op, n);
-  qb->filter_op[n] = '\0';
+  if (n >= sizeof(leaf->as.leaf.op)) n = sizeof(leaf->as.leaf.op) - 1;
+  memcpy(leaf->as.leaf.op, op, n);
+  leaf->as.leaf.op[n] = '\0';
 
-  /* Store value as string for v1 simplicity */
-  snprintf(qb->filter_value, sizeof(qb->filter_value), "%s", (const char*)value);
-  qb->filter_value_len = strlen(qb->filter_value);
-  qb->has_filter = 1;
+  snprintf(leaf->as.leaf.value, sizeof(leaf->as.leaf.value), "%s", (const char*)value);
+  leaf->as.leaf.value_len = strlen(leaf->as.leaf.value);
+
+  if (qb->root_condition) {
+    qb_condition_t* and_node = (qb_condition_t*)calloc(1, sizeof(*and_node));
+    if (!and_node) { free(leaf); return KANBUDB_ERR_OOM; }
+    and_node->type = QBCOND_AND;
+    and_node->as.comb.left = qb->root_condition;
+    and_node->as.comb.right = leaf;
+    qb->root_condition = and_node;
+  } else {
+    qb->root_condition = leaf;
+  }
 
   return KANBUDB_OK;
 }
@@ -133,6 +142,98 @@ int qb_join(query_builder_t* qb, const char* table,
   qb->has_join = 1;
 
   return KANBUDB_OK;
+}
+
+qb_condition_t* qb_cond(query_builder_t* qb, const char* column,
+                         const char* op, const void* value) {
+  (void)qb;
+  if (!column || !op || !value) return NULL;
+
+  qb_condition_t* cond = (qb_condition_t*)calloc(1, sizeof(*cond));
+  if (!cond) return NULL;
+
+  cond->type = QBCOND_LEAF;
+  size_t n = strlen(column);
+  if (n >= sizeof(cond->as.leaf.column)) n = sizeof(cond->as.leaf.column) - 1;
+  memcpy(cond->as.leaf.column, column, n);
+  cond->as.leaf.column[n] = '\0';
+
+  n = strlen(op);
+  if (n >= sizeof(cond->as.leaf.op)) n = sizeof(cond->as.leaf.op) - 1;
+  memcpy(cond->as.leaf.op, op, n);
+  cond->as.leaf.op[n] = '\0';
+
+  snprintf(cond->as.leaf.value, sizeof(cond->as.leaf.value), "%s", (const char*)value);
+  cond->as.leaf.value_len = strlen(cond->as.leaf.value);
+
+  return cond;
+}
+
+qb_condition_t* qb_cond_and(query_builder_t* qb,
+                            qb_condition_t* left, qb_condition_t* right) {
+  (void)qb;
+  if (!left || !right) return NULL;
+
+  qb_condition_t* cond = (qb_condition_t*)calloc(1, sizeof(*cond));
+  if (!cond) return NULL;
+
+  cond->type = QBCOND_AND;
+  cond->as.comb.left = left;
+  cond->as.comb.right = right;
+  return cond;
+}
+
+qb_condition_t* qb_cond_or(query_builder_t* qb,
+                           qb_condition_t* left, qb_condition_t* right) {
+  (void)qb;
+  if (!left || !right) return NULL;
+
+  qb_condition_t* cond = (qb_condition_t*)calloc(1, sizeof(*cond));
+  if (!cond) return NULL;
+
+  cond->type = QBCOND_OR;
+  cond->as.comb.left = left;
+  cond->as.comb.right = right;
+  return cond;
+}
+
+qb_condition_t* qb_cond_not(query_builder_t* qb, qb_condition_t* child) {
+  (void)qb;
+  if (!child) return NULL;
+
+  qb_condition_t* cond = (qb_condition_t*)calloc(1, sizeof(*cond));
+  if (!cond) return NULL;
+
+  cond->type = QBCOND_NOT;
+  cond->as.neg.child = child;
+  return cond;
+}
+
+int qb_where(query_builder_t* qb, qb_condition_t* cond) {
+  if (!qb || !cond) return KANBUDB_ERR_INVAL;
+
+  if (qb->root_condition) {
+    condition_destroy(qb->root_condition);
+  }
+  qb->root_condition = cond;
+  return KANBUDB_OK;
+}
+
+void condition_destroy(qb_condition_t* cond) {
+  if (!cond) return;
+  switch (cond->type) {
+    case QBCOND_LEAF:
+      break;
+    case QBCOND_AND:
+    case QBCOND_OR:
+      condition_destroy(cond->as.comb.left);
+      condition_destroy(cond->as.comb.right);
+      break;
+    case QBCOND_NOT:
+      condition_destroy(cond->as.neg.child);
+      break;
+  }
+  free(cond);
 }
 
 static i64 parse_int(const char* s) {
@@ -201,6 +302,48 @@ int filter_match(const void* col_data, i32 col_len,
   return 0;
 }
 
+/* Context for condition_match: column metadata needed to resolve names to indices */
+typedef struct {
+  row_schema_t*         schema;
+  char**                col_names;
+  kanbudb_col_type_t*   col_types;
+  int                   num_cols;
+  const void*           row_data;
+  i32                   row_len;
+} condition_match_ctx_t;
+
+static int condition_match(qb_condition_t* cond, condition_match_ctx_t* ctx) {
+  if (!cond || !ctx) return 0;
+
+  switch (cond->type) {
+    case QBCOND_LEAF: {
+      int col_idx = -1;
+      for (int i = 0; i < ctx->num_cols; i++) {
+        if (strcmp(ctx->col_names[i], cond->as.leaf.column) == 0) {
+          col_idx = i;
+          break;
+        }
+      }
+      if (col_idx < 0) return 0;
+      i32 col_len;
+      const void* col_data = row_extract_column(ctx->schema, col_idx,
+                                                 ctx->row_data, ctx->row_len, &col_len);
+      if (!col_data) return 0;
+      return filter_match(col_data, col_len, ctx->col_types[col_idx],
+                           cond->as.leaf.op, cond->as.leaf.value);
+    }
+    case QBCOND_AND:
+      return condition_match(cond->as.comb.left, ctx)
+          && condition_match(cond->as.comb.right, ctx);
+    case QBCOND_OR:
+      return condition_match(cond->as.comb.left, ctx)
+          || condition_match(cond->as.comb.right, ctx);
+    case QBCOND_NOT:
+      return !condition_match(cond->as.neg.child, ctx);
+  }
+  return 0;
+}
+
 /* Simple hash set for dedup keys from LSM */
 typedef struct {
   const void** keys;
@@ -247,12 +390,11 @@ static void key_set_destroy(key_set_t* ks) {
 }
 
 typedef struct {
-  key_set_t*         seen_keys;
-  query_builder_t*   qb;
-  row_schema_t*      row_schema;
-  int                filter_col;
-  kanbudb_col_type_t filter_type;
-  result_set_t*      rs;
+  key_set_t*              seen_keys;
+  query_builder_t*        qb;
+  row_schema_t*           row_schema;
+  condition_match_ctx_t*  match_ctx;
+  result_set_t*           rs;
 } lsm_scan_ctx_t;
 
 static int lsm_scan_cb(const lsm_entry_t* entry, void* ctx) {
@@ -262,14 +404,10 @@ static int lsm_scan_cb(const lsm_entry_t* entry, void* ctx) {
   key_set_add(c->seen_keys, entry->key, entry->key_len);
 
   int pass = 1;
-  if (c->qb->has_filter && c->filter_col >= 0) {
-    i32 col_len;
-    const void* col_data = row_extract_column(c->row_schema, c->filter_col,
-                                                entry->value, (i32)entry->val_len, &col_len);
-    if (col_data) {
-      pass = filter_match(col_data, col_len, c->filter_type,
-                           c->qb->filter_op, c->qb->filter_value);
-    }
+  if (c->qb->root_condition) {
+    c->match_ctx->row_data = entry->value;
+    c->match_ctx->row_len = (i32)entry->val_len;
+    pass = condition_match(c->qb->root_condition, c->match_ctx);
   }
   if (pass) {
     rs_add_row(c->rs, entry->value, entry->val_len);
@@ -347,18 +485,14 @@ result_set_t* qb_exec(query_builder_t* qb) {
   row_schema_t row_schema;
   row_schema_init(&row_schema, rs->col_types, rs->num_cols);
 
-  /* Determine filter column index */
-  int filter_col = -1;
-  kanbudb_col_type_t filter_type = KANBUDB_INT32;
-  if (qb->has_filter) {
-    for (int i = 0; i < rs->num_cols; i++) {
-      if (strcmp(rs->col_names[i], qb->filter_column) == 0) {
-        filter_col = i;
-        filter_type = rs->col_types[i];
-        break;
-      }
-    }
-  }
+  /* Set up condition match context */
+  condition_match_ctx_t match_ctx;
+  match_ctx.schema = &row_schema;
+  match_ctx.col_names = rs->col_names;
+  match_ctx.col_types = rs->col_types;
+  match_ctx.num_cols = rs->num_cols;
+  match_ctx.row_data = NULL;
+  match_ctx.row_len = 0;
 
   /* ---- LSM scan first (collect seen keys + matching rows) ---- */
   key_set_t seen_keys;
@@ -369,8 +503,7 @@ result_set_t* qb_exec(query_builder_t* qb) {
     ctx.seen_keys = &seen_keys;
     ctx.qb = qb;
     ctx.row_schema = &row_schema;
-    ctx.filter_col = filter_col;
-    ctx.filter_type = filter_type;
+    ctx.match_ctx = &match_ctx;
     ctx.rs = rs;
 
     kanbudb_memtable_t* active = lsm_get_active(internal->lsm);
@@ -389,14 +522,10 @@ result_set_t* qb_exec(query_builder_t* qb) {
           if (key_set_contains(&seen_keys, kv.key, kv.key_len))
             continue;
           int pass = 1;
-          if (qb->has_filter && filter_col >= 0) {
-            i32 col_len;
-            const void* col_data = row_extract_column(&row_schema, filter_col,
-                                                        kv.value, (i32)kv.val_len, &col_len);
-            if (col_data) {
-              pass = filter_match(col_data, col_len, filter_type,
-                                   qb->filter_op, qb->filter_value);
-            }
+          if (qb->root_condition) {
+            match_ctx.row_data = kv.value;
+            match_ctx.row_len = (i32)kv.val_len;
+            pass = condition_match(qb->root_condition, &match_ctx);
           }
           if (pass) {
             rs_add_row(rs, kv.value, kv.val_len);
@@ -594,6 +723,8 @@ result_set_t* qb_exec(query_builder_t* qb) {
 }
 
 void qb_destroy(query_builder_t* qb) {
+  if (!qb) return;
+  condition_destroy(qb->root_condition);
   free(qb);
 }
 
