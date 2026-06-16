@@ -10,8 +10,11 @@
 #include "fts/index.h"
 #include "fts/tokenizer.h"
 #include "fts/parser.h"
+#include "fts/ranker.h"
 #include "vector.h"
 #include "embedding.h"
+#include "quantize_internal.h"
+#include "vec_filter.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -484,6 +487,9 @@ int db_close(db_t* db) {
   if (internal->fts_index) fts_index_destroy(internal->fts_index);
   if (internal->vec_index) kanbudb_vec_close(internal->vec_index);
   if (internal->embed) kanbudb_embed_destroy(internal->embed);
+  if (internal->quantizer) kanbudb_quant_destroy(internal->quantizer);
+  free(internal->quant_vectors);
+  free(internal->quant_ids);
   btree_destroy(internal->btree);
   lsm_destroy(internal->lsm);
   wal_destroy(internal->wal);
@@ -1014,6 +1020,387 @@ int db_vec_set_embed(db_t* db, kanbudb_embed_t* embed)
     if (internal->embed) kanbudb_embed_destroy(internal->embed);
     internal->embed = embed;
     internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
+}
+
+/* ── Filtered vector search ─────────────────────────────────── */
+
+int db_vec_search_filtered(db_t* db, const float* query, uint32_t k,
+                           db_vec_filter_fn filter, void* filter_ctx,
+                           kanbudb_vec_result_t* results)
+{
+    if (!db || !query || !results || k == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    int rc = kanbudb_vec_search_filtered(internal->vec_index, query, k,
+                                         filter, filter_ctx, results);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+int db_vec_search_text_filtered(db_t* db, const char* text, size_t text_len,
+                                uint32_t k, db_vec_filter_fn filter,
+                                void* filter_ctx,
+                                kanbudb_vec_result_t* results)
+{
+    if (!db || !text || !results || k == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->vec_index || !internal->embed) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    uint32_t dim = kanbudb_embed_dimensions(internal->embed);
+    float* qvec = (float*)malloc((size_t)dim * sizeof(float));
+    if (!qvec) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    int rc = kanbudb_embed_text(internal->embed, text, text_len, qvec);
+    if (rc == 0)
+        rc = kanbudb_vec_search_filtered(internal->vec_index, qvec, k,
+                                         filter, filter_ctx, results);
+    free(qvec);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc;
+}
+
+/* ── Hybrid search (vector + FTS fusion) ────────────────────── */
+
+int db_hybrid_search(db_t* db, const char* table, const char* column,
+                     const char* fts_query, const float* vec_query,
+                     const kanbudb_hybrid_params_t* params,
+                     kanbudb_hybrid_result_t* results, int max_results)
+{
+    if (!db || !table || !column || !fts_query || !vec_query ||
+        !params || !results || max_results <= 0)
+        return KANBUDB_ERR_INVAL;
+
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+
+    if (!internal->vec_index || !internal->fts_index) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+
+    /* 1. Vector search */
+    uint32_t vec_k = params->k > 0 ? params->k : 10;
+    kanbudb_vec_result_t* vec_results = NULL;
+    int vec_count = 0;
+    if (vec_k > 0) {
+        vec_results = (kanbudb_vec_result_t*)malloc(vec_k * sizeof(kanbudb_vec_result_t));
+        if (vec_results) {
+            vec_count = kanbudb_vec_search(internal->vec_index, vec_query,
+                                           vec_k, vec_results);
+            if (vec_count < 0) vec_count = 0;
+        }
+    }
+
+    /* 2. FTS search */
+    fts_query_node_t nodes[64];
+    int num_nodes = fts_query_parse(fts_query, nodes, 64);
+
+    uint64_t fts_ids_buf[1024];
+    double fts_scores_buf[1024];
+    int fts_count = 0;
+
+    for (int i = 0; i < num_nodes && fts_count < 1024; i++) {
+        if (nodes[i].op == FTS_TERM || nodes[i].op == FTS_FUZZY) {
+            uint64_t doc_results[256];
+            int n;
+            if (nodes[i].op == FTS_FUZZY) {
+                int max_edits = nodes[i].fuzzy_distance > 0 ? nodes[i].fuzzy_distance : 1;
+                n = fts_index_search_fuzzy(internal->fts_index, nodes[i].text,
+                                           max_edits, doc_results, 256);
+            } else {
+                n = fts_index_search(internal->fts_index, nodes[i].text,
+                                     doc_results, 256);
+            }
+            for (int j = 0; j < n && fts_count < 1024; j++) {
+                int already = 0;
+                for (int m = 0; m < fts_count; m++) {
+                    if (fts_ids_buf[m] == doc_results[j]) { already = 1; break; }
+                }
+                if (!already) {
+                    fts_ids_buf[fts_count] = doc_results[j];
+                    fts_scores_buf[fts_count] = bm25_score(1.0, 10.0, 10.0,
+                        (double)internal->fts_index->total_docs,
+                        1.0, 1.2, 0.75);
+                    fts_count++;
+                }
+            }
+        }
+    }
+
+    /* 3. Merge results with RRF */
+    kanbudb_hybrid_result_t* merged = NULL;
+    int merged_count = 0;
+
+    if (vec_count > 0 || fts_count > 0) {
+        merged = (kanbudb_hybrid_result_t*)malloc(
+            (size_t)(vec_count + fts_count) * sizeof(kanbudb_hybrid_result_t));
+        if (!merged) {
+            free(vec_results);
+            pthread_rwlock_unlock(&internal->rwlock);
+            return KANBUDB_ERR_OOM;
+        }
+
+        const double k = 60.0;
+        /* Add vector results */
+        for (int i = 0; i < vec_count; i++) {
+            merged[merged_count].id = vec_results[i].id;
+            merged[merged_count].vec_distance = (double)vec_results[i].distance;
+            merged[merged_count].fts_score = 0.0;
+            merged[merged_count].score = params->vec_weight * (1.0 / (k + (double)(i + 1)));
+            merged_count++;
+        }
+
+        /* Add FTS results */
+        for (int i = 0; i < fts_count; i++) {
+            int found = -1;
+            for (int j = 0; j < merged_count; j++) {
+                if (merged[j].id == fts_ids_buf[i]) { found = j; break; }
+            }
+            if (found >= 0) {
+                /* Boost existing entry */
+                merged[found].fts_score = fts_scores_buf[i];
+                merged[found].score += params->fts_weight * (1.0 / (k + (double)(i + 1)));
+            } else {
+                merged[merged_count].id = fts_ids_buf[i];
+                merged[merged_count].vec_distance = 0.0;
+                merged[merged_count].fts_score = fts_scores_buf[i];
+                merged[merged_count].score = params->fts_weight * (1.0 / (k + (double)(i + 1)));
+                merged_count++;
+            }
+        }
+    }
+
+    /* Sort by score descending */
+    /* Simple selection sort for small result sets */
+    for (int i = 0; i < merged_count - 1; i++) {
+        int best = i;
+        for (int j = i + 1; j < merged_count; j++) {
+            if (merged[j].score > merged[best].score) best = j;
+        }
+        if (best != i) {
+            kanbudb_hybrid_result_t tmp = merged[i];
+            merged[i] = merged[best];
+            merged[best] = tmp;
+        }
+    }
+
+    /* Output top results */
+    int out_count = merged_count < max_results ? merged_count : max_results;
+    for (int i = 0; i < out_count; i++) {
+        results[i] = merged[i];
+    }
+
+    free(merged);
+    free(vec_results);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return out_count;
+}
+
+/* ── Vector quantization ────────────────────────────────────── */
+
+int db_vec_quant_create(db_t* db, const kanbudb_quant_params_t* params)
+{
+    if (!db || !params) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+
+    if (internal->quantizer) kanbudb_quant_destroy(internal->quantizer);
+    internal->quantizer = NULL;
+
+    kanbudb_quant_params_t qparams = *params;
+    if (qparams.dimension == 0 && internal->vec_index)
+        qparams.dimension = (uint32_t)kanbudb_vec_dimension(internal->vec_index);
+
+    int rc = kanbudb_quant_create(&qparams, &internal->quantizer);
+    if (rc != 0) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_OOM;
+    }
+
+    internal->quant_count = 0;
+    internal->quant_capacity = 4096;
+    internal->quant_vectors = (float*)calloc(internal->quant_capacity,
+        qparams.dimension * sizeof(float));
+    internal->quant_ids = (uint64_t*)calloc(internal->quant_capacity, sizeof(uint64_t));
+
+    internal->last_error = KANBUDB_OK;
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
+}
+
+void db_vec_quant_destroy(db_t* db)
+{
+    if (!db) return;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+    if (internal->quantizer) {
+        kanbudb_quant_destroy(internal->quantizer);
+        internal->quantizer = NULL;
+    }
+    free(internal->quant_vectors);
+    free(internal->quant_ids);
+    internal->quant_vectors = NULL;
+    internal->quant_ids = NULL;
+    internal->quant_count = 0;
+    internal->quant_capacity = 0;
+    pthread_rwlock_unlock(&internal->rwlock);
+}
+
+int db_vec_quant_train(db_t* db, const float* vectors, uint32_t count)
+{
+    if (!db || !vectors || count == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+    if (!internal->quantizer) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+    int rc = kanbudb_quant_train(internal->quantizer, vectors, count);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return rc == 0 ? KANBUDB_OK : KANBUDB_ERR_IO;
+}
+
+int db_vec_quant_insert(db_t* db, uint64_t id, const float* vector)
+{
+    if (!db || !vector) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_wrlock(&internal->rwlock);
+    if (!internal->quantizer) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+
+    uint32_t dim = internal->quantizer->params.dimension;
+    if (internal->quant_count >= internal->quant_capacity) {
+        uint32_t new_cap = internal->quant_capacity * 2;
+        float* new_vecs = (float*)realloc(internal->quant_vectors,
+            (size_t)new_cap * dim * sizeof(float));
+        uint64_t* new_ids = (uint64_t*)realloc(internal->quant_ids,
+            (size_t)new_cap * sizeof(uint64_t));
+        if (!new_vecs || !new_ids) {
+            free(new_vecs); free(new_ids);
+            pthread_rwlock_unlock(&internal->rwlock);
+            return KANBUDB_ERR_OOM;
+        }
+        internal->quant_vectors = new_vecs;
+        internal->quant_ids = new_ids;
+        internal->quant_capacity = new_cap;
+    }
+
+    memcpy(internal->quant_vectors + (size_t)internal->quant_count * dim,
+           vector, dim * sizeof(float));
+    internal->quant_ids[internal->quant_count] = id;
+    internal->quant_count++;
+
+    /* Also insert into the raw vector index if available */
+    if (internal->vec_index) {
+        kanbudb_vec_insert(internal->vec_index, id, vector);
+    }
+
+    pthread_rwlock_unlock(&internal->rwlock);
+    return KANBUDB_OK;
+}
+
+int db_vec_quant_search(db_t* db, const float* query, uint32_t k,
+                        kanbudb_vec_result_t* results)
+{
+    if (!db || !query || !results || k == 0) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->quantizer) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+
+    uint32_t dim = internal->quantizer->params.dimension;
+    uint32_t code_size = kanbudb_quant_code_size(internal->quantizer);
+
+    /* Encode query */
+    uint8_t* qcode = (uint8_t*)malloc(code_size);
+    if (!qcode) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    kanbudb_quant_encode(internal->quantizer, query, qcode, NULL);
+
+    /* Scan all quantized vectors, compute approximate distances */
+    uint32_t n = internal->quant_count;
+    if (k > n) k = n;
+    if (n == 0) { free(qcode); pthread_rwlock_unlock(&internal->rwlock); return 0; }
+
+    /* Simple scan with approximate distance */
+    kanbudb_vec_result_t* tmp = (kanbudb_vec_result_t*)malloc(n * sizeof(kanbudb_vec_result_t));
+    if (!tmp) { free(qcode); pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t* vcode = (uint8_t*)malloc(code_size);
+        if (!vcode) continue;
+        kanbudb_quant_encode(internal->quantizer,
+                             internal->quant_vectors + (size_t)i * dim,
+                             vcode, NULL);
+        tmp[i].id = internal->quant_ids[i];
+        tmp[i].distance = kanbudb_quant_distance(internal->quantizer,
+                                                  qcode, code_size,
+                                                  vcode, code_size);
+        free(vcode);
+    }
+
+    /* Partial sort for top-K */
+    for (uint32_t i = 0; i < k; i++) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (tmp[j].distance < tmp[best].distance) best = j;
+        }
+        if (best != i) {
+            kanbudb_vec_result_t t = tmp[i]; tmp[i] = tmp[best]; tmp[best] = t;
+        }
+    }
+
+    for (uint32_t i = 0; i < k; i++) results[i] = tmp[i];
+
+    free(tmp);
+    free(qcode);
+    pthread_rwlock_unlock(&internal->rwlock);
+    return (int)k;
+}
+
+int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
+{
+    if (!db || !out_vector) return KANBUDB_ERR_INVAL;
+    struct kanbudb_db* internal = (struct kanbudb_db*)db;
+    pthread_rwlock_rdlock(&internal->rwlock);
+    if (!internal->quantizer) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_INVAL;
+    }
+
+    /* Find the ID */
+    int idx = -1;
+    for (uint32_t i = 0; i < internal->quant_count; i++) {
+        if (internal->quant_ids[i] == id) { idx = (int)i; break; }
+    }
+    if (idx < 0) {
+        pthread_rwlock_unlock(&internal->rwlock);
+        return KANBUDB_ERR_NOTFOUND;
+    }
+
+    uint32_t dim = internal->quantizer->params.dimension;
+    uint32_t code_size = kanbudb_quant_code_size(internal->quantizer);
+
+    uint8_t* code = (uint8_t*)malloc(code_size);
+    if (!code) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+
+    kanbudb_quant_encode(internal->quantizer,
+                         internal->quant_vectors + (size_t)idx * dim,
+                         code, NULL);
+    kanbudb_quant_decode(internal->quantizer, code, code_size, out_vector);
+
+    free(code);
     pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_OK;
 }

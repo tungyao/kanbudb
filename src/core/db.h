@@ -34,6 +34,11 @@ struct kanbudb_db {
   kanbudb_fts_index_t*  fts_index;
   kanbudb_vec_index_t*  vec_index;
   kanbudb_embed_t*      embed;
+  kanbudb_quantizer_t*  quantizer;
+  float*               quant_vectors;
+  uint64_t*            quant_ids;
+  uint32_t             quant_count;
+  uint32_t             quant_capacity;
   pthread_rwlock_t     rwlock;
 };
 

@@ -136,6 +136,69 @@ int db_vec_count(db_t *db);
 int db_vec_flush(db_t *db);
 int db_vec_set_embed(db_t *db, kanbudb_embed_t *embed);
 
+/* ── Filtered vector search ─────────────────────────────────── */
+typedef int (*db_vec_filter_fn)(uint64_t id, void *ctx);
+
+int db_vec_search_filtered(db_t *db, const float *query, uint32_t k,
+                           db_vec_filter_fn filter, void *filter_ctx,
+                           kanbudb_vec_result_t *results);
+
+int db_vec_search_text_filtered(db_t *db, const char *text, size_t text_len,
+                                uint32_t k, db_vec_filter_fn filter,
+                                void *filter_ctx,
+                                kanbudb_vec_result_t *results);
+
+/* ── Hybrid search (vector + FTS fusion) ────────────────────── */
+typedef enum {
+    KANBUDB_HYBRID_RRF = 0,
+    KANBUDB_HYBRID_WEIGHTED = 1
+} kanbudb_hybrid_mode_t;
+
+typedef struct {
+    kanbudb_hybrid_mode_t mode;
+    double vec_weight;
+    double fts_weight;
+    uint32_t k;
+} kanbudb_hybrid_params_t;
+
+#define KANBUDB_HYBRID_PARAMS_DEFAULT \
+    { .mode = KANBUDB_HYBRID_RRF, .vec_weight = 0.5, .fts_weight = 0.5, .k = 10 }
+
+typedef struct {
+    uint64_t id;
+    double   score;
+    double   vec_distance;
+    double   fts_score;
+} kanbudb_hybrid_result_t;
+
+int db_hybrid_search(db_t *db, const char *table, const char *column,
+                     const char *fts_query, const float *vec_query,
+                     const kanbudb_hybrid_params_t *params,
+                     kanbudb_hybrid_result_t *results, int max_results);
+
+/* ── Vector quantization ────────────────────────────────────── */
+typedef struct kanbudb_quantizer kanbudb_quantizer_t;
+
+typedef enum {
+    KANBUDB_QUANT_NONE = 0,
+    KANBUDB_QUANT_SQ8 = 1,
+    KANBUDB_QUANT_PQ = 2
+} kanbudb_quant_type_t;
+
+typedef struct {
+    kanbudb_quant_type_t type;
+    uint32_t dimension;
+    uint32_t pq_subspaces;
+} kanbudb_quant_params_t;
+
+int  db_vec_quant_create(db_t *db, const kanbudb_quant_params_t *params);
+void db_vec_quant_destroy(db_t *db);
+int  db_vec_quant_train(db_t *db, const float *vectors, uint32_t count);
+int  db_vec_quant_insert(db_t *db, uint64_t id, const float *vector);
+int  db_vec_quant_search(db_t *db, const float *query, uint32_t k,
+                         kanbudb_vec_result_t *results);
+int  db_vec_quant_decode(db_t *db, uint64_t id, float *out_vector);
+
 #ifdef __cplusplus
 }
 #endif

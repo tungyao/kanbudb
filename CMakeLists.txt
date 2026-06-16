@@ -27,13 +27,16 @@ set(KANBUDB_SOURCES
   src/vector/persistence.c
   src/vector/hnsw.c
   src/vector/embedding.c
+  src/vector/quantize.c
+  src/vector/vec_filter.c
+  src/hybrid/hybrid.c
 )
 
 add_library(kanbudb_static STATIC ${KANBUDB_SOURCES})
-target_include_directories(kanbudb_static PUBLIC include src/util src/storage src src/vector)
+target_include_directories(kanbudb_static PUBLIC include src/util src/storage src src/vector src/hybrid src/fts)
 
 add_library(kanbudb_shared SHARED ${KANBUDB_SOURCES})
-target_include_directories(kanbudb_shared PUBLIC include src/util src/storage src src/vector)
+target_include_directories(kanbudb_shared PUBLIC include src/util src/storage src src/vector src/hybrid src/fts)
 
 find_package(Threads REQUIRED)
 target_link_libraries(kanbudb_static PRIVATE Threads::Threads m)
@@ -135,6 +138,21 @@ if(KANBUDB_BUILD_TESTS)
   target_include_directories(test_embed PRIVATE src/vector src)
   target_link_libraries(test_embed kanbudb_static m)
   add_test(NAME test_embed COMMAND test_embed)
+
+  add_executable(test_quantize test/unit/test_quantize.c)
+  target_include_directories(test_quantize PRIVATE src/vector)
+  target_link_libraries(test_quantize kanbudb_static m)
+  add_test(NAME test_quantize COMMAND test_quantize)
+
+  add_executable(test_hybrid test/unit/test_hybrid.c)
+  target_include_directories(test_hybrid PRIVATE src/vector src/hybrid src/fts src)
+  target_link_libraries(test_hybrid kanbudb_static m)
+  add_test(NAME test_hybrid COMMAND test_hybrid)
+
+  add_executable(test_vec_filter test/unit/test_vec_filter.c)
+  target_include_directories(test_vec_filter PRIVATE src/vector)
+  target_link_libraries(test_vec_filter kanbudb_static m)
+  add_test(NAME test_vec_filter COMMAND test_vec_filter)
 
   add_executable(bench_vector test/bench/bench_vector.c)
   target_include_directories(bench_vector PRIVATE src/vector)
