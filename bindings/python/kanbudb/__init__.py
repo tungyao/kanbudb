@@ -222,6 +222,63 @@ _lib.kanbudb_vec_count.restype = ctypes.c_int
 _lib.kanbudb_vec_dimension.argtypes = [ctypes.c_void_p]
 _lib.kanbudb_vec_dimension.restype = ctypes.c_int
 
+# ── DB-level vector + embedding function signatures ──────────────────
+
+class _DbVecOptions(ctypes.Structure):
+    _fields_ = [
+        ("dimension", ctypes.c_uint32),
+        ("ngram_size", ctypes.c_uint32),
+        ("enable_hnsw", ctypes.c_int),
+        ("hnsw_m", ctypes.c_uint32),
+        ("hnsw_ef_construction", ctypes.c_uint32),
+    ]
+
+_lib.db_vec_create_index.argtypes = [ctypes.c_void_p, ctypes.POINTER(_DbVecOptions)]
+_lib.db_vec_create_index.restype = ctypes.c_int
+
+_lib.db_vec_destroy_index.argtypes = [ctypes.c_void_p]
+_lib.db_vec_destroy_index.restype = ctypes.c_int
+
+_lib.db_vec_insert_text.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t]
+_lib.db_vec_insert_text.restype = ctypes.c_int
+
+_lib.db_vec_search_text.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_uint32, ctypes.POINTER(_VecResult),
+]
+_lib.db_vec_search_text.restype = ctypes.c_int
+
+_lib.db_vec_search.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.POINTER(_VecResult),
+]
+_lib.db_vec_search.restype = ctypes.c_int
+
+_lib.db_vec_delete.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+_lib.db_vec_delete.restype = ctypes.c_int
+
+_lib.db_vec_insert_vector.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+_lib.db_vec_insert_vector.restype = ctypes.c_int
+
+_lib.db_vec_count.argtypes = [ctypes.c_void_p]
+_lib.db_vec_count.restype = ctypes.c_int
+
+# ── Standalone embedding function signatures ─────────────────────────
+
+_lib.kanbudb_embed_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+_lib.kanbudb_embed_create.restype = ctypes.c_int
+
+_lib.kanbudb_embed_destroy.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_embed_destroy.restype = None
+
+_lib.kanbudb_embed_text.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_float),
+]
+_lib.kanbudb_embed_text.restype = ctypes.c_int
+
+_lib.kanbudb_embed_dimensions.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_embed_dimensions.restype = ctypes.c_uint32
+
 
 # ── High-level Python API ────────────────────────────────────────────
 
@@ -545,6 +602,73 @@ class Database:
         """Return the dimension of vectors in the index."""
         return _lib.kanbudb_vec_dimension(ctypes.c_void_p(idx))
 
+    # ── DB-level Vector (auto-embedding) ─────────────────────────
+
+    def vec_create_index(self, dimension: int = 128, ngram_size: int = 3,
+                         enable_hnsw: bool = False, hnsw_m: int = 16,
+                         hnsw_ef_construction: int = 200):
+        """Create a DB-level vector index with built-in text embedding.
+
+        Args:
+            dimension: Embedding dimension (default 128).
+            ngram_size: N-gram size for embedding (default 3).
+            enable_hnsw: Use HNSW index instead of flat scan.
+            hnsw_m: HNSW M parameter.
+            hnsw_ef_construction: HNSW ef_construction parameter.
+        """
+        opts = _DbVecOptions(
+            dimension=dimension,
+            ngram_size=ngram_size,
+            enable_hnsw=1 if enable_hnsw else 0,
+            hnsw_m=hnsw_m,
+            hnsw_ef_construction=hnsw_ef_construction,
+        )
+        rc = _lib.db_vec_create_index(self._ptr, ctypes.byref(opts))
+        _check(rc)
+
+    def vec_destroy_index(self):
+        """Destroy the DB-level vector index."""
+        _lib.db_vec_destroy_index(self._ptr)
+
+    def vec_insert_text(self, vid: int, text: str):
+        """Insert text into the DB-level vector index (auto-embeds).
+
+        Args:
+            vid: Unique 64-bit ID.
+            text: Text to embed and index.
+        """
+        encoded = text.encode("utf-8")
+        rc = _lib.db_vec_insert_text(self._ptr, ctypes.c_uint64(vid), encoded, len(encoded))
+        _check(rc)
+
+    def vec_search_text(self, query: str, k: int = 10):
+        """Search by text query (auto-embeds and searches).
+
+        Returns:
+            List of (id, distance) tuples.
+        """
+        encoded = query.encode("utf-8")
+        results = (_VecResult * k)()
+        n = _lib.db_vec_search_text(
+            self._ptr, encoded, len(encoded), ctypes.c_uint32(k), results
+        )
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
+
+    def vec_insert_vector(self, vid: int, vector: list):
+        """Insert a raw vector into the DB-level index."""
+        arr = (ctypes.c_float * len(vector))(*vector)
+        _check(_lib.db_vec_insert_vector(self._ptr, ctypes.c_uint64(vid), arr))
+
+    def vec_delete_by_id(self, vid: int):
+        """Delete a vector from the DB-level index."""
+        _check(_lib.db_vec_delete(self._ptr, ctypes.c_uint64(vid)))
+
+    def vec_count(self) -> int:
+        """Return count of vectors in the DB-level index."""
+        return _lib.db_vec_count(self._ptr)
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def close(self):
@@ -575,3 +699,39 @@ def open(path: str, **kw) -> Database:
         Database instance.
     """
     return Database(path, **kw)
+
+
+class Embedding:
+    """Standalone text embedding using KanbuDB's built-in n-gram hash + random projection."""
+
+    def __init__(self, dimensions: int = 128, ngram_size: int = 3):
+        self._ptr = ctypes.c_void_p()
+        rc = _lib.kanbudb_embed_create(
+            ctypes.c_uint32(dimensions),
+            ctypes.c_uint32(ngram_size),
+            ctypes.byref(self._ptr),
+        )
+        _check(rc)
+        self._dim = dimensions
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
+
+    def embed(self, text: str) -> list[float]:
+        """Embed text into a float vector."""
+        encoded = text.encode("utf-8")
+        vec = (ctypes.c_float * self._dim)()
+        rc = _lib.kanbudb_embed_text(
+            self._ptr, encoded, len(encoded), vec
+        )
+        _check(rc)
+        return list(vec)
+
+    def close(self):
+        if self._ptr and self._ptr.value:
+            _lib.kanbudb_embed_destroy(self._ptr)
+            self._ptr.value = 0
+
+    def __del__(self):
+        self.close()
