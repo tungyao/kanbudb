@@ -177,7 +177,7 @@ static int schema_load_cb(const void* key, size_t key_len,
   for (int j = 0; j < num_cols; j++) {
     int col_type;
     char col_name[256];
-    if (sscanf(p, "|%d:%255s%n", &col_type, col_name, &consumed) < 2) break;
+    if (sscanf(p, "|%d:%255[^|]%n", &col_type, col_name, &consumed) < 2) break;
     p += consumed;
     t->col_types[j] = (kanbudb_col_type_t)col_type;
     t->col_names[j] = strdup(col_name);
