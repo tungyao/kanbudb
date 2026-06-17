@@ -375,13 +375,8 @@ static int db_flush_memtable(struct kanbudb_db* db) {
 
   lsm_destroy_flushing(db->lsm);
 
-  wal_truncate(db->wal);
-
-  if (db->multi_enabled) {
-    db->shm.header->sstable_generation++;
-    db->shm.header->wal_checkpointed = KANBUDB_WAL_HEADER_SIZE;
-    db->shm.header->wal_committed_end = KANBUDB_WAL_HEADER_SIZE;
-    __sync_synchronize();
+  if (!db->multi_enabled) {
+    wal_truncate(db->wal);
   }
 
   return rc;
@@ -393,6 +388,111 @@ static int find_table(struct kanbudb_db* db, const char* name) {
       return i;
   }
   return -1;
+}
+
+/* ── WAL checkpoint: flush all WAL frames to SSTable ─────── */
+
+static int wal_checkpoint_apply_cb(const kanbudb_wal_frame_t* frame, void* ctx) {
+  struct kanbudb_db* db = (struct kanbudb_db*)ctx;
+  if (frame->op == 1) {
+    btree_delete(db->btree, frame->key, frame->key_len);
+  } else {
+    btree_put(db->btree, frame->key, frame->key_len,
+              frame->value, frame->val_len);
+  }
+  return 0;
+}
+
+static int db_wal_checkpoint(struct kanbudb_db* db) {
+  char wal_path[512];
+  snprintf(wal_path, sizeof(wal_path), "%s.wal", db->path);
+
+  uint64_t start = db->shm.header->wal_checkpointed;
+  uint64_t end = db->shm.header->wal_committed_end;
+  if (end <= start || end == KANBUDB_WAL_HEADER_SIZE) return KANBUDB_OK;
+
+  /* Build the btree from SSTables + apply WAL frames on top */
+  btree_destroy(db->btree);
+  db->btree = btree_create();
+  if (!db->btree) return KANBUDB_ERR_OOM;
+
+  if (db->multi_enabled) {
+    close(db->manifest.fd);
+    db->manifest.fd = open(db->manifest.path, O_RDWR, 0644);
+    kanbudb_manifest_reload(&db->manifest);
+  }
+  for (int i = 0; i < db->manifest.num_entries; i++) {
+    sstable_reader_t* sr = sstable_reader_open(db->manifest.paths[i]);
+    if (sr) {
+      sstable_reader_scan(sr, &sstable_load_cb, db);
+      sstable_reader_close(sr);
+    }
+  }
+
+  /* Apply WAL frames on top (newer data wins) */
+  kanbudb_wal_scan_frames(wal_path, start, end,
+                           &wal_checkpoint_apply_cb, db);
+
+  /* Create SSTable from the merged btree */
+  uint64_t seq = db_persistent_seq(db->path);
+  char sst_path[512], tmp_path[512];
+  snprintf(sst_path, sizeof(sst_path), "%s.sst.0.%llu",
+           db->path, (unsigned long long)seq);
+  snprintf(tmp_path, sizeof(tmp_path), "%s.sst.0.%llu.tmp",
+           db->path, (unsigned long long)seq);
+
+  sstable_writer_t* w = sstable_writer_create(tmp_path, sst_path, seq);
+  if (!w) return KANBUDB_ERR_OOM;
+
+  btree_cursor_t* cur = btree_cursor_create(db->btree);
+  if (!cur) { sstable_writer_destroy(w); return KANBUDB_ERR_OOM; }
+
+  int rc = btree_cursor_seek(cur, NULL, 0);
+  if (rc == KANBUDB_OK) {
+    btree_kv_t kv;
+    while (btree_cursor_next(cur, &kv) == KANBUDB_OK) {
+      rc = sstable_writer_add(w, kv.key, kv.key_len,
+                               kv.value, kv.val_len,
+                               KANBUDB_SSTABLE_FLAG_ALIVE);
+      if (rc != KANBUDB_OK) break;
+    }
+  }
+  btree_cursor_destroy(cur);
+
+  if (rc == KANBUDB_OK) rc = sstable_writer_finish(w);
+  sstable_writer_destroy(w);
+  if (rc != KANBUDB_OK) return rc;
+
+  /* Remove OLD SSTables from manifest — this checkpoint SSTable now
+   * contains the merged state of ALL previous SSTables + WAL frames.
+   * Keeping old SSTables would cause deleted keys to reappear on reload. */
+  for (int i = db->manifest.num_entries - 1; i >= 0; i--) {
+    kanbudb_manifest_remove(&db->manifest, db->manifest.paths[i]);
+  }
+  kanbudb_manifest_add(&db->manifest, sst_path, 0, seq);
+
+  db->shm.header->sstable_generation++;
+  __sync_synchronize();
+
+  wal_truncate(db->wal);
+
+  db->shm.header->wal_checkpointed = KANBUDB_WAL_HEADER_SIZE;
+  db->shm.header->wal_committed_end = KANBUDB_WAL_HEADER_SIZE;
+  __sync_synchronize();
+
+  /* Reload system SSTable to keep schema */
+  char sys_path[512];
+  snprintf(sys_path, sizeof(sys_path), "%s.system", db->path);
+  sstable_reader_t* sr = sstable_reader_open(sys_path);
+  if (sr) {
+    schema_load_ctx_t lc;
+    memset(&lc, 0, sizeof(lc));
+    lc.db = db;
+    sstable_reader_scan(sr, &schema_load_cb, &lc);
+    sstable_reader_close(sr);
+  }
+
+  return KANBUDB_OK;
 }
 
 /* ── Multi-process WAL apply callback ─────────────────────── */
@@ -587,7 +687,12 @@ int db_close(db_t* db) {
   internal->compact_running = 0;
   pthread_join(internal->compact_thread, NULL);
 
-  if (lsm_has_data(internal->lsm)) {
+  if (internal->multi_enabled) {
+    /* In multi-process mode, the WAL contains frames from ALL writer
+     * processes.  Checkpoint the entire WAL to SSTable before truncating,
+     * otherwise frames written by other processes are lost forever. */
+    db_wal_checkpoint(internal);
+  } else if (lsm_has_data(internal->lsm)) {
     db_flush_memtable(internal);
   }
 

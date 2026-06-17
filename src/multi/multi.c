@@ -16,6 +16,8 @@ static size_t shm_size(void) {
 void kanbudb_shm_init(struct kanbudb_shm_header* hdr) {
     memset(hdr, 0, shm_size());
     hdr->magic = KANBUDB_SHM_MAGIC;
+    hdr->wal_checkpointed = 20; /* KANBUDB_WAL_HEADER_SIZE */
+    hdr->wal_committed_end = 20;
 }
 
 int kanbudb_shm_open(const char* db_path, kanbudb_shm_t* out) {
