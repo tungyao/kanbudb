@@ -2,24 +2,27 @@
 #define KANBUDB_SSTABLE_H
 
 #include "macros.h"
+#include "bloom.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ── SSTable on-disk format ──────────────────────────────
+/* ── SSTable on-disk format (v2) ──────────────────────────
  *
- * [HEADER]  28 bytes (see sstable_header_t)
+ * [HEADER]  48 bytes (see sstable_header_t)
  * [DATA]    sorted entries, each:
  *             key_len(u32) + key_bytes + flag(u8) + val_len(u32) + val_bytes
  *           flag: 0x01=alive, 0x02=tombstone
  * [INDEX]   sparse index, every 32 entries:
  *             num_entries(u32) + { key_len(u32) + key + offset(u64) } * N
- * [FOOTER]  CHECKSUM_ALL(u32)  CRC32 of data+index bytes
+ * [BLOOM]   serialized bloom filter (optional, v2+)
+ *             num_bits(u32) + num_hashes(u32) + num_keys(u32) + bit_array
+ * [FOOTER]  CHECKSUM_ALL(u32)  CRC32 of data+index+bloom bytes
  *──────────────────────────────────────────────────────────*/
 
 #define KANBUDB_SSTABLE_MAGIC         0x4B534E54U  /* "KSNT" */
-#define KANBUDB_SSTABLE_VERSION       1
+#define KANBUDB_SSTABLE_VERSION       2
 #define KANBUDB_SSTABLE_SPARSE_INTERVAL 32
 
 #define KANBUDB_SSTABLE_FLAG_ALIVE     0x01U
@@ -32,6 +35,7 @@ typedef struct {
     uint64_t num_entries;
     uint64_t data_len;
     uint64_t index_offset;   /* byte offset from file start to index block */
+    uint64_t bloom_offset;   /* byte offset to bloom filter (0 = none, v2+) */
     uint64_t sequence;       /* WAL seq at flush time */
     uint64_t created_at;     /* unix sec */
 } sstable_header_t;

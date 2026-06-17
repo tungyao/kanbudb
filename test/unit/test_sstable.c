@@ -80,15 +80,13 @@ static int test_write_read_basic(void) {
     uint8_t flag = 0;
     int rc = sstable_reader_get(r, "hello", 6, &val, &vlen, &flag);
     if (rc != KANBUDB_OK || !val || strcmp((char*)val, "world") != 0) {
-        free(val); sstable_reader_close(r); return 0;
+        sstable_reader_close(r); return 0;
     }
-    free(val); val = NULL;
 
     rc = sstable_reader_get(r, "key2", 5, &val, &vlen, &flag);
     if (rc != KANBUDB_OK || !val || strcmp((char*)val, "value2") != 0) {
-        free(val); sstable_reader_close(r); return 0;
+        sstable_reader_close(r); return 0;
     }
-    free(val); val = NULL;
 
     /* Not found */
     rc = sstable_reader_get(r, "nope", 5, &val, &vlen, &flag);
@@ -130,7 +128,6 @@ static int test_tombstone(void) {
     /* Alive key returns OK */
     int rc = sstable_reader_get(r, "alive", 6, &val, &vlen, &flag);
     if (rc != KANBUDB_OK) { sstable_reader_close(r); return 0; }
-    free(val); val = NULL;
 
     /* Tombstone returns NOTFOUND */
     rc = sstable_reader_get(r, "gone", 5, &val, &vlen, &flag);
@@ -179,15 +176,14 @@ static int test_many_entries(void) {
                                      &val, &vlen, &flag);
         if (rc != KANBUDB_OK) {
             fprintf(stderr, "  DEBUG: key '%s' rc=%d\n", keys[i], rc);
-            free(val); sstable_reader_close(r); return 0;
+            sstable_reader_close(r); return 0;
         }
         if (!val || vlen != strlen(vals[i]) + 1 ||
             memcmp(val, vals[i], vlen) != 0) {
             fprintf(stderr, "  DEBUG: key '%s' val mismatch (vlen=%zu, expected=%zu)\n",
                     keys[i], vlen, strlen(vals[i]) + 1);
-            free(val); sstable_reader_close(r); return 0;
+            sstable_reader_close(r); return 0;
         }
-        free(val);
     }
 
     sstable_reader_close(r);

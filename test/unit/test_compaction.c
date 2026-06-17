@@ -84,21 +84,18 @@ static int test_merge_two_files(void) {
 
     rc = sstable_reader_get(r, "a", 2, &val, &vlen, &flag);
     if (rc != KANBUDB_OK || !val || strcmp((char*)val, "1") != 0) {
-        free(val); sstable_reader_close(r); return 0;
+        sstable_reader_close(r); return 0;
     }
-    free(val); val = NULL;
 
     rc = sstable_reader_get(r, "b", 2, &val, &vlen, &flag);
     if (rc != KANBUDB_OK || !val || strcmp((char*)val, "3") != 0) {
-        free(val); sstable_reader_close(r); return 0;
+        sstable_reader_close(r); return 0;
     }
-    free(val); val = NULL;
 
     rc = sstable_reader_get(r, "c", 2, &val, &vlen, &flag);
     if (rc != KANBUDB_OK || !val || strcmp((char*)val, "4") != 0) {
-        free(val); sstable_reader_close(r); return 0;
+        sstable_reader_close(r); return 0;
     }
-    free(val);
 
     sstable_reader_close(r);
     cleanup();

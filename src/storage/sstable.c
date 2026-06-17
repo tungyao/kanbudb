@@ -6,8 +6,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <errno.h>
+
+/* Bloom filter bits-per-key for SSTable point queries */
+#define SSTABLE_BLOOM_BITS_PER_KEY 10
 
 /* ── CRC32 (table-driven) ────────────────────────────────── */
 
@@ -50,6 +54,9 @@ struct sstable_writer {
     uint8_t*    index_buf;
     size_t      index_cap;
     size_t      index_len;
+    /* bloom filter — built during adds, serialized at finish */
+    kanbudb_bloom_t* bloom;
+    uint32_t          bloom_initialized;
 };
 
 sstable_writer_t* sstable_writer_create(const char* tmp_path,
@@ -93,6 +100,8 @@ sstable_writer_t* sstable_writer_create(const char* tmp_path,
     }
 
     w->data_len = 0;
+    w->bloom = NULL;
+    w->bloom_initialized = 0;
     return w;
 }
 
@@ -140,6 +149,17 @@ int sstable_writer_add(sstable_writer_t* w,
     if (val_len > 0 && value && fwrite(value, 1, val_len, w->tmp_file) != val_len)
         return KANBUDB_ERR_IO;
 
+    /* Build bloom filter lazily on first insert */
+    if (!w->bloom) {
+        /* Estimate: if next_seq grows properly we won't know final count.
+           Use a reasonable initial estimate and let it saturate. */
+        w->bloom = kanbudb_bloom_create(65536, SSTABLE_BLOOM_BITS_PER_KEY);
+        if (w->bloom) w->bloom_initialized = 1;
+    }
+    if (w->bloom) {
+        kanbudb_bloom_insert(w->bloom, key, key_len);
+    }
+
     w->num_entries++;
     w->data_len += entry_bytes;
     return KANBUDB_OK;
@@ -179,31 +199,33 @@ int sstable_writer_finish(sstable_writer_t* w) {
             return KANBUDB_ERR_IO;
     }
 
-    /* Compute CRC32 over data + index bytes */
-    uint64_t footer_start = (uint64_t)ftell(w->tmp_file);
-    (void)footer_start;
+    /* Write bloom filter (between index and footer) */
+    uint64_t bloom_offset = 0;
+    if (w->bloom && w->bloom_initialized && w->num_entries > 0) {
+        bloom_offset = (uint64_t)ftell(w->tmp_file);
+        uint32_t bsz = kanbudb_bloom_serialized_size(w->bloom);
+        uint8_t* bbuf = (uint8_t*)malloc(bsz);
+        if (bbuf) {
+            kanbudb_bloom_serialize(w->bloom, bbuf);
+            if (fwrite(bbuf, 1, bsz, w->tmp_file) != bsz) {
+                free(bbuf);
+                return KANBUDB_ERR_IO;
+            }
+            free(bbuf);
+        }
+    }
 
-    /* Go back and read all data bytes for CRC */
+    /* Compute CRC32 over data + index + bloom bytes */
+    uint64_t footer_start = (uint64_t)ftell(w->tmp_file);
     uint32_t checksum = 0;
     {
         fflush(w->tmp_file);
-        /* Read data block */
-        size_t data_bytes = (size_t)(index_offset - sizeof(sstable_header_t));
-        uint8_t* buf = (uint8_t*)malloc(data_bytes + 1);
+        size_t total_bytes = (size_t)(footer_start - sizeof(sstable_header_t));
+        uint8_t* buf = (uint8_t*)malloc(total_bytes);
         if (buf) {
             fseek(w->tmp_file, sizeof(sstable_header_t), SEEK_SET);
-            if (fread(buf, 1, data_bytes, w->tmp_file) == data_bytes) {
-                checksum = crc32_bytes(buf, data_bytes, 0);
-                /* Also include index bytes */
-                size_t idx_bytes_total = (size_t)(footer_start - index_offset);
-                uint8_t* idx_buf = (uint8_t*)malloc(idx_bytes_total);
-                if (idx_buf) {
-                    fseek(w->tmp_file, (long)index_offset, SEEK_SET);
-                    if (fread(idx_buf, 1, idx_bytes_total, w->tmp_file) == idx_bytes_total) {
-                        checksum = crc32_bytes(idx_buf, idx_bytes_total, checksum);
-                    }
-                    free(idx_buf);
-                }
+            if (fread(buf, 1, total_bytes, w->tmp_file) == total_bytes) {
+                checksum = crc32_bytes(buf, total_bytes, 0);
             }
             free(buf);
         }
@@ -222,6 +244,7 @@ int sstable_writer_finish(sstable_writer_t* w) {
     hdr.num_entries = w->num_entries;
     hdr.data_len    = index_offset - sizeof(sstable_header_t);
     hdr.index_offset = index_offset;
+    hdr.bloom_offset = bloom_offset;
     hdr.sequence    = w->sequence;
     hdr.created_at  = (uint64_t)time(NULL);
 
@@ -264,6 +287,7 @@ void sstable_writer_destroy(sstable_writer_t* w) {
         fclose(w->tmp_file);
         unlink(w->tmp_path);
     }
+    kanbudb_bloom_destroy(w->bloom);
     free(w->tmp_path);
     free(w->final_path);
     free(w->index_buf);
@@ -279,26 +303,19 @@ typedef struct {
     uint64_t offset;
 } sstable_idx_entry_t;
 
-/* ── Reader ──────────────────────────────────────────────── */
+/* ── Reader (mmap-based, zero-copy) ─────────────────────── */
 
 struct sstable_reader {
     char*          path;
-    FILE*          file;
+    int            fd;            /* file descriptor for mmap */
+    uint8_t*       mapped;        /* mmap base pointer */
+    size_t         mapped_size;   /* total mmap size */
     sstable_header_t header;
-    sstable_idx_entry_t* index;
+    sstable_idx_entry_t* index;  /* index entries point into mapped region */
     uint32_t       index_count;
-    uint32_t       crc_ok;    /* 0=not checked, 1=ok, -1=fail */
+    uint32_t       crc_ok;       /* 0=not checked, 1=ok, -1=fail */
+    kanbudb_bloom_t* bloom;
 };
-
-static int idx_cmp(const void* a, const void* b) {
-    const uint8_t* key_a = (const uint8_t*)a;
-    sstable_idx_entry_t* ib = (sstable_idx_entry_t*)b;
-    size_t ka_len = strlen((const char*)key_a);  /* caller passes full key via a */
-    (void)ka_len;
-    /* Actually we need a custom comparator that takes lengths.
-       The bsearch callback doesn't support passing lengths. We'll do binary search manually. */
-    return 0; /* dummy */
-}
 
 sstable_reader_t* sstable_reader_open(const char* path) {
     if (!path) return NULL;
@@ -308,77 +325,75 @@ sstable_reader_t* sstable_reader_open(const char* path) {
 
     r->path = strdup(path);
     if (!r->path) { free(r); return NULL; }
+    r->fd = -1;  /* ensure close path doesn't close stdin */
+    r->mapped = MAP_FAILED;
 
-    r->file = fopen(path, "rb");
-    if (!r->file) { free(r->path); free(r); return NULL; }
+    /* Open file, get size, mmap */
+    r->fd = open(path, O_RDONLY);
+    if (r->fd < 0) { free(r->path); free(r); return NULL; }
 
-    /* Read header */
-    if (fread(&r->header, sizeof(r->header), 1, r->file) != 1) {
-        fclose(r->file); free(r->path); free(r);
-        return NULL;
+    struct stat st;
+    if (fstat(r->fd, &st) != 0) { close(r->fd); free(r->path); free(r); return NULL; }
+    r->mapped_size = (size_t)st.st_size;
+
+    r->mapped = (uint8_t*)mmap(NULL, r->mapped_size, PROT_READ, MAP_SHARED, r->fd, 0);
+    if (r->mapped == MAP_FAILED) { close(r->fd); free(r->path); free(r); return NULL; }
+
+    /* Parse header from mapped memory */
+    memcpy(&r->header, r->mapped, sizeof(sstable_header_t));
+
+    if (r->header.magic != KANBUDB_SSTABLE_MAGIC) {
+        sstable_reader_close(r); return NULL;
+    }
+    if (r->header.version > KANBUDB_SSTABLE_VERSION) {
+        sstable_reader_close(r); return NULL;
     }
 
-    if (r->header.magic != KANBUDB_SSTABLE_MAGIC ||
-        r->header.version != KANBUDB_SSTABLE_VERSION) {
-        fclose(r->file); free(r->path); free(r);
-        return NULL;
-    }
-
-    /* Read index block */
-    fseek(r->file, (long)r->header.index_offset, SEEK_SET);
+    /* Parse index block — entries point directly into mmap region */
     uint32_t num_idx = 0;
-    if (fread(&num_idx, sizeof(uint32_t), 1, r->file) != 1) {
-        fclose(r->file); free(r->path); free(r);
-        return NULL;
-    }
+    uint8_t* idx_ptr = r->mapped + r->header.index_offset;
+    memcpy(&num_idx, idx_ptr, sizeof(uint32_t));
+    idx_ptr += sizeof(uint32_t);
 
     r->index_count = num_idx;
     if (num_idx > 0) {
         r->index = (sstable_idx_entry_t*)calloc(num_idx, sizeof(sstable_idx_entry_t));
-        if (!r->index) {
-            fclose(r->file); free(r->path); free(r);
-            return NULL;
-        }
+        if (!r->index) { sstable_reader_close(r); return NULL; }
+
         for (uint32_t i = 0; i < num_idx; i++) {
             uint32_t kl;
-            if (fread(&kl, sizeof(uint32_t), 1, r->file) != 1) {
-                sstable_reader_close(r); return NULL;
-            }
+            memcpy(&kl, idx_ptr, sizeof(uint32_t));
+            idx_ptr += sizeof(uint32_t);
             r->index[i].key_len = kl;
-            r->index[i].key = (uint8_t*)malloc(kl + 1);
-            if (!r->index[i].key) { sstable_reader_close(r); return NULL; }
-            if (kl > 0 && fread(r->index[i].key, 1, kl, r->file) != kl) {
-                sstable_reader_close(r); return NULL;
-            }
-            r->index[i].key[kl] = '\0';
-            if (fread(&r->index[i].offset, sizeof(uint64_t), 1, r->file) != 1) {
-                sstable_reader_close(r); return NULL;
-            }
+            r->index[i].key = idx_ptr;  /* points into mmap — zero copy! */
+            idx_ptr += kl;
+            memcpy(&r->index[i].offset, idx_ptr, sizeof(uint64_t));
+            idx_ptr += sizeof(uint64_t);
         }
     }
 
-    /* Verify CRC32 (optional — tolerate failure) */
-    {
-        fseek(r->file, 0, SEEK_END);
-        long file_len = ftell(r->file);
-        if (file_len > (long)sizeof(uint32_t)) {
-            uint32_t stored_crc = 0;
-            fseek(r->file, -(long)sizeof(uint32_t), SEEK_END);
-            if (fread(&stored_crc, sizeof(uint32_t), 1, r->file) == 1) {
-                size_t verify_len = (size_t)(file_len - (long)sizeof(uint32_t));
-                uint8_t* verify_buf = (uint8_t*)malloc(verify_len);
-                if (verify_buf) {
-                    fseek(r->file, 0, SEEK_SET);
-                    if (fread(verify_buf, 1, verify_len, r->file) == verify_len) {
-                        uint32_t computed = crc32_bytes(verify_buf, verify_len, 0);
-                        r->crc_ok = (computed == stored_crc) ? 1 : -1;
-                    }
-                    free(verify_buf);
-                }
-            }
+    /* Load bloom filter (v2+, optional) — loads from mmap into private copy */
+    r->bloom = NULL;
+    if (r->header.version >= 2 && r->header.bloom_offset > 0) {
+        uint8_t* bloom_ptr = r->mapped + r->header.bloom_offset;
+        uint32_t b_nb, b_nh, b_nk;
+        memcpy(&b_nb, bloom_ptr, 4);
+        memcpy(&b_nh, bloom_ptr + 4, 4);
+        memcpy(&b_nk, bloom_ptr + 8, 4);
+        uint32_t b_bytes = (b_nb + 7) / 8;
+        uint32_t bsz = 12 + b_bytes;
+        if (r->header.bloom_offset + bsz <= r->mapped_size) {
+            r->bloom = kanbudb_bloom_load(bloom_ptr, bsz);
         }
-        /* Reset to data start */
-        fseek(r->file, sizeof(sstable_header_t), SEEK_SET);
+    }
+
+    /* Verify CRC32 (optional — from mmap, no extra alloc) */
+    if (r->mapped_size > (size_t)sizeof(uint32_t)) {
+        uint32_t stored_crc;
+        memcpy(&stored_crc, r->mapped + r->mapped_size - sizeof(uint32_t), sizeof(uint32_t));
+        size_t verify_len = r->mapped_size - sizeof(uint32_t);
+        uint32_t computed = crc32_bytes(r->mapped, verify_len, 0);
+        r->crc_ok = (computed == stored_crc) ? 1 : -1;
     }
 
     return r;
@@ -386,13 +401,13 @@ sstable_reader_t* sstable_reader_open(const char* path) {
 
 void sstable_reader_close(sstable_reader_t* r) {
     if (!r) return;
-    if (r->file) fclose(r->file);
+    if (r->mapped && r->mapped != MAP_FAILED)
+        munmap(r->mapped, r->mapped_size);
+    if (r->fd >= 0) close(r->fd);
     free(r->path);
-    if (r->index) {
-        for (uint32_t i = 0; i < r->index_count; i++)
-            free(r->index[i].key);
-        free(r->index);
-    }
+    /* Index keys point into mmap region — no per-entry free needed */
+    free(r->index);
+    kanbudb_bloom_unload(r->bloom);
     free(r);
 }
 
@@ -423,28 +438,28 @@ int sstable_reader_get(sstable_reader_t* r,
                         uint8_t* out_flag) {
     if (!r || !key) return KANBUDB_ERR_INVAL;
 
-    /* Binary search sparse index to find starting point.
-     * index_lower_bound returns the first idx entry with key >= target.
-     * We need to scan from the previous block (or idx 0 if the target
-     * falls before/between first index key). */
+    /* Bloom filter check: skip if key definitely not in this SSTable */
+    if (r->bloom && !kanbudb_bloom_maybe(r->bloom, key, key_len)) {
+        return KANBUDB_ERR_NOTFOUND;
+    }
+
+    /* Binary search sparse index to find starting point */
     uint32_t idx_pos = index_lower_bound(r->index, r->index_count, key, key_len);
     uint32_t max_entries = (uint32_t)(r->header.num_entries);
 
+    uint8_t* data_start;
     uint32_t start_entry = 0;
     if (r->index_count > 0) {
         if (idx_pos > 0) {
-            /* Target falls after idx[idx_pos-1].key — scan from that block */
             uint32_t bi = idx_pos - 1;
-            fseek(r->file, (long)r->index[bi].offset, SEEK_SET);
+            data_start = r->mapped + r->index[bi].offset;
             start_entry = bi * KANBUDB_SSTABLE_SPARSE_INTERVAL;
         } else {
-            /* Target <= first index key — scan from very start */
-            fseek(r->file, (long)r->index[0].offset, SEEK_SET);
+            data_start = r->mapped + r->index[0].offset;
             start_entry = 0;
         }
     } else {
-        /* No index — full scan from start of data */
-        fseek(r->file, sizeof(sstable_header_t), SEEK_SET);
+        data_start = r->mapped + sizeof(sstable_header_t);
         start_entry = 0;
     }
 
@@ -452,19 +467,23 @@ int sstable_reader_get(sstable_reader_t* r,
     uint32_t limit = start_entry + 2 * KANBUDB_SSTABLE_SPARSE_INTERVAL;
     if (limit > max_entries) limit = max_entries;
 
-    uint32_t entry_idx = start_entry;
-    while (entry_idx < limit) {
+    uint8_t* p = data_start;
+    for (uint32_t i = start_entry; i < limit; i++) {
+        /* Parse entry from mmap region — zero copy */
         uint32_t kl;
-        if (fread(&kl, sizeof(uint32_t), 1, r->file) != 1) break;
-        uint8_t* kbuf = (uint8_t*)malloc(kl + 1);
-        if (!kbuf) return KANBUDB_ERR_OOM;
-        if (kl > 0 && fread(kbuf, 1, kl, r->file) != kl) { free(kbuf); break; }
-        kbuf[kl] = '\0';
+        memcpy(&kl, p, sizeof(uint32_t));
+        p += sizeof(uint32_t);
 
-        uint8_t  fl;
+        uint8_t* kbuf = p;
+        p += kl;
+
+        uint8_t fl;
+        memcpy(&fl, p, sizeof(uint8_t));
+        p += sizeof(uint8_t);
+
         uint32_t vl;
-        if (fread(&fl, sizeof(uint8_t), 1, r->file) != 1) { free(kbuf); break; }
-        if (fread(&vl, sizeof(uint32_t), 1, r->file) != 1) { free(kbuf); break; }
+        memcpy(&vl, p, sizeof(uint32_t));
+        p += sizeof(uint32_t);
 
         int cmp = 0;
         size_t min_len = key_len < kl ? key_len : kl;
@@ -475,37 +494,26 @@ int sstable_reader_get(sstable_reader_t* r,
         }
 
         if (cmp == 0) {
-            /* Found */
             if (out_flag) *out_flag = fl;
             if (fl & KANBUDB_SSTABLE_FLAG_TOMBSTONE) {
-                free(kbuf);
                 return KANBUDB_ERR_NOTFOUND;
             }
             if (out_value && out_val_len) {
-                *out_value = malloc(vl);
-                if (!*out_value && vl > 0) { free(kbuf); return KANBUDB_ERR_OOM; }
-                if (vl > 0 && fread(*out_value, 1, vl, r->file) != vl) {
-                    free(*out_value); free(kbuf); return KANBUDB_ERR_CORRUPT;
-                }
+                /* Return pointer directly into mmap region — zero copy.
+                 * Caller MUST copy data if they need it past reader lifetime. */
+                *out_value = p;
                 *out_val_len = vl;
-            } else if (vl > 0) {
-                /* skip value bytes */
-                fseek(r->file, (long)vl, SEEK_CUR);
             }
-            free(kbuf);
             return KANBUDB_OK;
         }
 
         if (cmp < 0) {
             /* Past where key would be — not found */
-            free(kbuf);
             return KANBUDB_ERR_NOTFOUND;
         }
 
         /* Skip value bytes */
-        if (vl > 0) fseek(r->file, (long)vl, SEEK_CUR);
-        free(kbuf);
-        entry_idx++;
+        p += vl;
     }
 
     return KANBUDB_ERR_NOTFOUND;
@@ -518,31 +526,31 @@ int sstable_reader_scan(sstable_reader_t* r,
                          void* ctx) {
     if (!r || !cb) return KANBUDB_ERR_INVAL;
 
-    fseek(r->file, sizeof(sstable_header_t), SEEK_SET);
+    uint8_t* p = r->mapped + sizeof(sstable_header_t);
+    uint8_t* end = r->mapped + r->mapped_size;
 
     for (uint64_t i = 0; i < r->header.num_entries; i++) {
+        if (p + sizeof(uint32_t) > end) break;
         uint32_t kl;
-        if (fread(&kl, sizeof(uint32_t), 1, r->file) != 1) break;
-        uint8_t* kbuf = (uint8_t*)malloc(kl + 1);
-        if (!kbuf) return KANBUDB_ERR_OOM;
-        if (kl > 0 && fread(kbuf, 1, kl, r->file) != kl) { free(kbuf); break; }
-        kbuf[kl] = '\0';
+        memcpy(&kl, p, sizeof(uint32_t));
+        p += sizeof(uint32_t);
 
-        uint8_t  fl;
+        if (p + kl + sizeof(uint8_t) + sizeof(uint32_t) > end) break;
+        uint8_t* kbuf = p;  /* points into mmap — zero copy */
+        p += kl;
+
+        uint8_t fl;
+        memcpy(&fl, p, sizeof(uint8_t));
+        p += sizeof(uint8_t);
+
         uint32_t vl;
-        if (fread(&fl, sizeof(uint8_t), 1, r->file) != 1) { free(kbuf); break; }
-        if (fread(&vl, sizeof(uint32_t), 1, r->file) != 1) { free(kbuf); break; }
+        memcpy(&vl, p, sizeof(uint32_t));
+        p += sizeof(uint32_t);
 
-        uint8_t* vbuf = NULL;
-        if (vl > 0) {
-            vbuf = (uint8_t*)malloc(vl);
-            if (!vbuf) { free(kbuf); return KANBUDB_ERR_OOM; }
-            if (fread(vbuf, 1, vl, r->file) != vl) { free(kbuf); free(vbuf); break; }
-        }
+        uint8_t* vbuf = (vl > 0) ? p : NULL;
+        p += vl;
 
         int rc = cb(kbuf, kl, vbuf, vl, fl, ctx);
-        free(kbuf);
-        free(vbuf);
         if (rc != 0) return rc;
     }
 

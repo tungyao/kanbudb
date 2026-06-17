@@ -39,7 +39,15 @@ struct kanbudb_db {
   uint64_t*            quant_ids;
   uint32_t             quant_count;
   uint32_t             quant_capacity;
-  pthread_rwlock_t     rwlock;
+  /* Fine-grained locking (lock order: table < wal < lsm < btree) */
+  pthread_rwlock_t     table_lock;   /* tables[] / schema */
+  pthread_mutex_t      wal_lock;     /* WAL append serialization */
+  pthread_rwlock_t     lsm_lock;     /* LSM memtable */
+  pthread_rwlock_t     btree_lock;   /* B-tree */
+  /* Background compaction */
+  pthread_t            compact_thread;
+  int                  compact_running;
+  int                  compact_trigger;
 };
 
 #endif /* KANBUDB_CORE_DB_H */

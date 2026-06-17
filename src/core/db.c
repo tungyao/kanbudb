@@ -15,6 +15,7 @@
 #include "embedding.h"
 #include "quantize_internal.h"
 #include "vec_filter.h"
+#include <unistd.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -238,43 +239,57 @@ static int db_checkpoint(struct kanbudb_db* db) {
   return rc;
 }
 
-/* ── Auto compaction ──────────────────────────────────────── */
+/* ── Background compaction worker ────────────────────────────── */
 
-static int db_compact_sstables(struct kanbudb_db* db) {
-  char* paths[256];
-  int num = sstable_scan_dir(db->path, paths, 256, NULL);
-  if (num < 2) {
-    for (int i = 0; i < num; i++) free(paths[i]);
-    return KANBUDB_OK;
-  }
-
-  uint64_t out_seq = lsm_next_seq(db->lsm);
-  char out_path[512];
-  snprintf(out_path, sizeof(out_path), "%s.sst.1.%llu",
-           db->path, (unsigned long long)out_seq);
-
-  kanbudb_compactor_t* c = compactor_create();
-  int rc = KANBUDB_ERR_OOM;
-  if (c) {
-    rc = compactor_merge_sstables(c, (const char**)paths, num, out_path, out_seq);
-    compactor_destroy(c);
-  }
-
-  /* Remove old SSTables if merge succeeded */
-  if (rc == KANBUDB_OK) {
-    for (int i = 0; i < num; i++) {
-      unlink(paths[i]);
+static void* compact_worker(void* arg) {
+  struct kanbudb_db* db = (struct kanbudb_db*)arg;
+  while (db->compact_running) {
+    /* Sleep 5 seconds between compaction checks */
+    for (int i = 0; i < 50 && db->compact_running; i++) {
+      usleep(100000); /* 100ms ticks, check running flag */
     }
-    /* Load merged SSTable into B-tree */
-    sstable_reader_t* sr = sstable_reader_open(out_path);
-    if (sr) {
-      sstable_reader_scan(sr, &sstable_load_cb, db);
-      sstable_reader_close(sr);
-    }
-  }
+    if (!db->compact_running) break;
 
-  for (int i = 0; i < num; i++) free(paths[i]);
-  return rc;
+    pthread_rwlock_wrlock(&db->table_lock);
+    pthread_rwlock_wrlock(&db->lsm_lock);
+    pthread_rwlock_wrlock(&db->btree_lock);
+    
+    kanbudb_level_t levels[KANBUDB_MAX_LEVELS];
+    compaction_scan_levels(db->path, levels, KANBUDB_MAX_LEVELS);
+    
+    int src_level = compaction_pick_level(levels, KANBUDB_MAX_LEVELS);
+    if (src_level >= 0 && levels[src_level].num_files > 0) {
+      int dst_level = src_level + 1;
+      uint64_t out_seq = lsm_next_seq(db->lsm);
+      
+      char out_path[512];
+      compaction_make_path(db->path, dst_level, out_seq, out_path, sizeof(out_path));
+      
+      int rc = compaction_merge_to_level(
+          (const char**)levels[src_level].file_paths,
+          levels[src_level].num_files,
+          out_path, out_seq);
+      
+      if (rc == KANBUDB_OK) {
+        /* Delete old files */
+        for (int i = 0; i < levels[src_level].num_files; i++) {
+          unlink(levels[src_level].file_paths[i]);
+        }
+        /* Load merged result into B-tree */
+        sstable_reader_t* sr = sstable_reader_open(out_path);
+        if (sr) {
+          sstable_reader_scan(sr, &sstable_load_cb, db);
+          sstable_reader_close(sr);
+        }
+      }
+    }
+    
+    compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
+    pthread_rwlock_unlock(&db->btree_lock);
+    pthread_rwlock_unlock(&db->lsm_lock);
+    pthread_rwlock_unlock(&db->table_lock);
+  }
+  return NULL;
 }
 
 /* ── SSTable path comparison (sort by seq number) ─────────── */
@@ -400,7 +415,10 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
   db->fts_index = fts_index_create();
   if (!db->fts_index) { btree_destroy(db->btree); lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return KANBUDB_ERR_OOM; }
 
-  pthread_rwlock_init(&db->rwlock, NULL);
+  pthread_rwlock_init(&db->table_lock, NULL);
+  pthread_mutex_init(&db->wal_lock, NULL);
+  pthread_rwlock_init(&db->lsm_lock, NULL);
+  pthread_rwlock_init(&db->btree_lock, NULL);
 
   db->num_tables = 0;
   db->last_error = KANBUDB_OK;
@@ -419,29 +437,30 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
     }
   }
 
-  /* Phase 2: load data SSTables into B-tree (sorted by seq) */
+  /* Phase 2: load data SSTables into B-tree (leveled order) */
   {
-    char* sst_paths[256];
-    int num_sst = sstable_scan_dir(path, sst_paths, 256, NULL);
+    kanbudb_level_t levels[KANBUDB_MAX_LEVELS];
+    compaction_scan_levels(path, levels, KANBUDB_MAX_LEVELS);
 
-    /* Sort by sequence number so newer data overwrites older */
-    if (num_sst > 1) {
-      qsort(sst_paths, (size_t)num_sst, sizeof(char*), &sst_path_cmp);
-    }
-
-    (void)0; /* debug placeholder */
-
-    for (int i = 0; i < num_sst; i++) {
-      sstable_reader_t* sr = sstable_reader_open(sst_paths[i]);
-      if (sr) {
-        sstable_reader_scan(sr, &sstable_load_cb, db);
-        sstable_reader_close(sr);
+    /* Load from L0 → L1 → ... → L7 so higher-level (more compacted) data wins */
+    for (int lvl = 0; lvl < KANBUDB_MAX_LEVELS; lvl++) {
+      for (int i = 0; i < levels[lvl].num_files; i++) {
+        sstable_reader_t* sr = sstable_reader_open(levels[lvl].file_paths[i]);
+        if (sr) {
+          sstable_reader_scan(sr, &sstable_load_cb, db);
+          sstable_reader_close(sr);
+        }
       }
-      free(sst_paths[i]);
     }
+    compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
   }
 
-  /* Phase 3: [disabled] auto compaction — seq not yet unique across sessions */
+  /* Phase 3: start background compaction thread */
+  {
+    db->compact_running = 1;
+    db->compact_trigger = 0;
+    pthread_create(&db->compact_thread, NULL, compact_worker, db);
+  }
 
   /* Phase 4: replay WAL for any unflushed writes */
   {
@@ -458,7 +477,15 @@ int db_close(db_t* db) {
   if (!db) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
 
-  pthread_rwlock_wrlock(&internal->rwlock);
+  /* Acquire all locks in order */
+  pthread_rwlock_wrlock(&internal->table_lock);
+  pthread_mutex_lock(&internal->wal_lock);
+  pthread_rwlock_wrlock(&internal->lsm_lock);
+  pthread_rwlock_wrlock(&internal->btree_lock);
+
+  /* Stop background compaction */
+  internal->compact_running = 0;
+  pthread_join(internal->compact_thread, NULL);
 
   /* Flush any remaining data in memtable */
   if (lsm_has_data(internal->lsm)) {
@@ -495,8 +522,14 @@ int db_close(db_t* db) {
   wal_destroy(internal->wal);
   free(internal->path);
 
-  pthread_rwlock_unlock(&internal->rwlock);
-  pthread_rwlock_destroy(&internal->rwlock);
+  pthread_rwlock_unlock(&internal->table_lock);
+  pthread_mutex_unlock(&internal->wal_lock);
+  pthread_rwlock_unlock(&internal->lsm_lock);
+  pthread_rwlock_unlock(&internal->btree_lock);
+  pthread_rwlock_destroy(&internal->table_lock);
+  pthread_mutex_destroy(&internal->wal_lock);
+  pthread_rwlock_destroy(&internal->lsm_lock);
+  pthread_rwlock_destroy(&internal->btree_lock);
   free(internal);
   return KANBUDB_OK;
 }
@@ -528,17 +561,17 @@ int db_create_table(db_t* db, const char* table_name,
   }
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_wrlock(&internal->rwlock);
+  pthread_rwlock_wrlock(&internal->table_lock);
 
   if (find_table(internal, table_name) >= 0) {
     internal->last_error = KANBUDB_ERR_EXISTS;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_EXISTS;
   }
 
   if (internal->num_tables >= KANBUDB_MAX_TABLES) {
     internal->last_error = KANBUDB_ERR_OOM;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_OOM;
   }
 
@@ -551,18 +584,18 @@ int db_create_table(db_t* db, const char* table_name,
   t->num_cols = num_columns;
 
   t->col_types = (kanbudb_col_type_t*)malloc((size_t)num_columns * sizeof(kanbudb_col_type_t));
-  if (!t->col_types) { internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+  if (!t->col_types) { internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
   memcpy(t->col_types, col_types, (size_t)num_columns * sizeof(kanbudb_col_type_t));
 
   t->col_names = (char**)malloc((size_t)num_columns * sizeof(char*));
-  if (!t->col_names) { free(t->col_types); internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+  if (!t->col_names) { free(t->col_types); internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
 
   for (int i = 0; i < num_columns; i++) {
     t->col_names[i] = strdup(col_names[i]);
     if (!t->col_names[i]) {
       for (int j = 0; j < i; j++) free(t->col_names[j]);
       free(t->col_names); free(t->col_types);
-      internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM;
+      internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM;
     }
   }
 
@@ -583,7 +616,7 @@ int db_create_table(db_t* db, const char* table_name,
   db_save_schema(internal);
 
   internal->last_error = KANBUDB_OK;
-  pthread_rwlock_unlock(&internal->rwlock);
+  pthread_rwlock_unlock(&internal->table_lock);
   return KANBUDB_OK;
 }
 
@@ -592,43 +625,52 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
   if (!db || !table || !key) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_wrlock(&internal->rwlock);
+  pthread_rwlock_rdlock(&internal->table_lock);
 
   int idx = find_table(internal, table);
   if (idx < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_NOTFOUND;
   }
+  uint64_t tbl_id = internal->tables[idx].id;
+  pthread_rwlock_unlock(&internal->table_lock);
 
+  pthread_mutex_lock(&internal->wal_lock);
   int rc = wal_append(internal->wal, KANBUDB_WAL_PUT,
-                       internal->tables[idx].id,
+                       tbl_id,
                        key, key_len, value, value_len);
+  pthread_mutex_unlock(&internal->wal_lock);
   if (rc != KANBUDB_OK) {
     internal->last_error = rc;
-    pthread_rwlock_unlock(&internal->rwlock);
     return rc;
   }
 
-  rc = lsm_put(internal->lsm, internal->tables[idx].id,
+  pthread_rwlock_wrlock(&internal->lsm_lock);
+  rc = lsm_put(internal->lsm, tbl_id,
                 key, key_len, value, value_len);
   if (rc != KANBUDB_OK) {
+    pthread_rwlock_unlock(&internal->lsm_lock);
     internal->last_error = rc;
-    pthread_rwlock_unlock(&internal->rwlock);
     return rc;
   }
 
-  if (lsm_is_full(internal->lsm)) {
+  int need_flush = lsm_is_full(internal->lsm);
+  if (need_flush) {
+    /* Upgrade to btree lock for flush, then flush */
+    pthread_rwlock_wrlock(&internal->btree_lock);
     int frc = db_flush_memtable(internal);
+    pthread_rwlock_unlock(&internal->btree_lock);
+    pthread_rwlock_unlock(&internal->lsm_lock);
     if (frc != KANBUDB_OK) {
       internal->last_error = frc;
-      pthread_rwlock_unlock(&internal->rwlock);
       return frc;
     }
+  } else {
+    pthread_rwlock_unlock(&internal->lsm_lock);
   }
 
   internal->last_error = KANBUDB_OK;
-  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
@@ -637,32 +679,35 @@ int db_get(db_t* db, const char* table, const char* key, size_t key_len,
   if (!db || !table || !key || !value || !value_len) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_rdlock(&internal->rwlock);
+  pthread_rwlock_rdlock(&internal->table_lock);
 
   int idx = find_table(internal, table);
   if (idx < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_NOTFOUND;
   }
+  uint64_t tbl_id = internal->tables[idx].id;
+  pthread_rwlock_unlock(&internal->table_lock);
 
-  int rc = lsm_get(internal->lsm, internal->tables[idx].id,
+  pthread_rwlock_rdlock(&internal->lsm_lock);
+  int rc = lsm_get(internal->lsm, tbl_id,
                     key, key_len, value, value_len);
+  pthread_rwlock_unlock(&internal->lsm_lock);
   if (rc == KANBUDB_OK) {
     internal->last_error = KANBUDB_OK;
-    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_OK;
   }
 
+  pthread_rwlock_rdlock(&internal->btree_lock);
   rc = btree_get(internal->btree, key, key_len, value, value_len);
+  pthread_rwlock_unlock(&internal->btree_lock);
   if (rc == KANBUDB_OK) {
     internal->last_error = KANBUDB_OK;
-    pthread_rwlock_unlock(&internal->rwlock);
     return KANBUDB_OK;
   }
 
   internal->last_error = KANBUDB_ERR_NOTFOUND;
-  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_ERR_NOTFOUND;
 }
 
@@ -670,42 +715,50 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
   if (!db || !table || !key) return KANBUDB_ERR_INVAL;
 
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_wrlock(&internal->rwlock);
+  pthread_rwlock_rdlock(&internal->table_lock);
 
   int idx = find_table(internal, table);
   if (idx < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_NOTFOUND;
   }
+  uint64_t tbl_id = internal->tables[idx].id;
+  pthread_rwlock_unlock(&internal->table_lock);
 
+  pthread_mutex_lock(&internal->wal_lock);
   int rc = wal_append(internal->wal, KANBUDB_WAL_DELETE,
-                       internal->tables[idx].id,
+                       tbl_id,
                        key, key_len, NULL, 0);
+  pthread_mutex_unlock(&internal->wal_lock);
   if (rc != KANBUDB_OK) {
     internal->last_error = rc;
-    pthread_rwlock_unlock(&internal->rwlock);
     return rc;
   }
 
-  rc = lsm_delete(internal->lsm, internal->tables[idx].id, key, key_len);
+  pthread_rwlock_wrlock(&internal->lsm_lock);
+  rc = lsm_delete(internal->lsm, tbl_id, key, key_len);
   if (rc != KANBUDB_OK) {
+    pthread_rwlock_unlock(&internal->lsm_lock);
     internal->last_error = rc;
-    pthread_rwlock_unlock(&internal->rwlock);
     return rc;
   }
 
-  if (lsm_is_full(internal->lsm)) {
+  int need_flush = lsm_is_full(internal->lsm);
+  if (need_flush) {
+    pthread_rwlock_wrlock(&internal->btree_lock);
     int frc = db_flush_memtable(internal);
+    pthread_rwlock_unlock(&internal->btree_lock);
+    pthread_rwlock_unlock(&internal->lsm_lock);
     if (frc != KANBUDB_OK) {
       internal->last_error = frc;
-      pthread_rwlock_unlock(&internal->rwlock);
       return frc;
     }
+  } else {
+    pthread_rwlock_unlock(&internal->lsm_lock);
   }
 
   internal->last_error = KANBUDB_OK;
-  pthread_rwlock_unlock(&internal->rwlock);
   return KANBUDB_OK;
 }
 
@@ -714,23 +767,23 @@ int db_fts_create_index(db_t* db, const char* table, const char* column,
   (void)opts;
   if (!db || !table || !column) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_wrlock(&internal->rwlock);
+  pthread_rwlock_wrlock(&internal->table_lock);
   if (find_table(internal, table) < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_NOTFOUND;
   }
   internal->last_error = KANBUDB_OK;
-  pthread_rwlock_unlock(&internal->rwlock);
+  pthread_rwlock_unlock(&internal->table_lock);
   return KANBUDB_OK;
 }
 
 int db_fts_drop_index(db_t* db, const char* table, const char* column) {
   if (!db || !table || !column) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_wrlock(&internal->rwlock);
+  pthread_rwlock_wrlock(&internal->table_lock);
   internal->last_error = KANBUDB_OK;
-  pthread_rwlock_unlock(&internal->rwlock);
+  pthread_rwlock_unlock(&internal->table_lock);
   return KANBUDB_OK;
 }
 
@@ -738,17 +791,17 @@ int db_fts_search(db_t* db, const char* table, const char* column,
                   const char* query, result_set_t** out) {
   if (!db || !table || !column || !query || !out) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
-  pthread_rwlock_rdlock(&internal->rwlock);
+  pthread_rwlock_rdlock(&internal->table_lock);
 
   if (find_table(internal, table) < 0) {
     internal->last_error = KANBUDB_ERR_NOTFOUND;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_NOTFOUND;
   }
 
   if (!internal->fts_index) {
     internal->last_error = KANBUDB_ERR_INVAL;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_INVAL;
   }
 
@@ -756,7 +809,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   int num_nodes = fts_query_parse(query, nodes, 64);
   if (num_nodes <= 0) {
     internal->last_error = KANBUDB_ERR_INVAL;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_ERR_INVAL;
   }
 
@@ -788,7 +841,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   }
 
   result_set_t* rs = (result_set_t*)calloc(1, sizeof(*rs));
-  if (!rs) { internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+  if (!rs) { internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
 
   rs->is_fts = 1;
   rs->num_rows = num_doc_ids;
@@ -803,7 +856,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
     rs->scores = (double*)calloc((size_t)num_doc_ids, sizeof(double));
     if (!rs->doc_ids || !rs->scores) {
       free(rs->doc_ids); free(rs->scores); free(rs);
-      internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM;
+      internal->last_error = KANBUDB_ERR_OOM; pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM;
     }
     memcpy(rs->doc_ids, doc_id_buf, (size_t)num_doc_ids * sizeof(uint64_t));
   } else {
@@ -814,7 +867,7 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   rs->current = -1;
   *out = rs;
   internal->last_error = KANBUDB_OK;
-  pthread_rwlock_unlock(&internal->rwlock);
+  pthread_rwlock_unlock(&internal->table_lock);
   return KANBUDB_OK;
 }
 
@@ -824,7 +877,7 @@ int db_vec_create_index(db_t* db, const db_vec_options_t* opts)
 {
     if (!db || !opts || opts->dimension == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
 
     if (internal->vec_index) {
         kanbudb_vec_close(internal->vec_index);
@@ -847,7 +900,7 @@ int db_vec_create_index(db_t* db, const db_vec_options_t* opts)
     snprintf(vec_path, sizeof(vec_path), "%s.vec", internal->path);
     int rc = kanbudb_vec_create(vec_path, &vparams, &internal->vec_index);
     if (rc != KANBUDB_VEC_OK) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return rc;
     }
 
@@ -856,7 +909,7 @@ int db_vec_create_index(db_t* db, const db_vec_options_t* opts)
                               &internal->embed);
 
     internal->last_error = KANBUDB_OK;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -864,7 +917,7 @@ int db_vec_destroy_index(db_t* db)
 {
     if (!db) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
 
     if (internal->vec_index) {
         kanbudb_vec_close(internal->vec_index);
@@ -876,7 +929,7 @@ int db_vec_destroy_index(db_t* db)
     }
 
     internal->last_error = KANBUDB_OK;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_OK;
 }
 
@@ -885,19 +938,19 @@ int db_vec_insert_text(db_t* db, uint64_t id,
 {
     if (!db || !text) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index || !internal->embed) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     uint32_t dim = kanbudb_embed_dimensions(internal->embed);
     float* vec = (float*)malloc((size_t)dim * sizeof(float));
-    if (!vec) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!vec) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
     int rc = kanbudb_embed_text(internal->embed, text, text_len, vec);
     if (rc == 0)
         rc = kanbudb_vec_insert(internal->vec_index, id, vec);
     free(vec);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -908,19 +961,19 @@ int db_vec_insert_batch(db_t* db, uint32_t count,
     if (!db || !ids || !texts || !text_lens || count == 0)
         return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index || !internal->embed) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     uint32_t dim = kanbudb_embed_dimensions(internal->embed);
     float* vecs = (float*)malloc((size_t)count * dim * sizeof(float));
-    if (!vecs) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!vecs) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
     int rc = kanbudb_embed_batch(internal->embed, texts, text_lens, count, vecs);
     if (rc == 0)
         rc = kanbudb_vec_insert_batch(internal->vec_index, count, ids, vecs);
     free(vecs);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -928,13 +981,13 @@ int db_vec_insert_vector(db_t* db, uint64_t id, const float* vector)
 {
     if (!db || !vector) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     int rc = kanbudb_vec_insert(internal->vec_index, id, vector);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -943,19 +996,19 @@ int db_vec_search_text(db_t* db, const char* text, size_t text_len,
 {
     if (!db || !text || !results || k == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index || !internal->embed) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     uint32_t dim = kanbudb_embed_dimensions(internal->embed);
     float* qvec = (float*)malloc((size_t)dim * sizeof(float));
-    if (!qvec) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!qvec) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
     int rc = kanbudb_embed_text(internal->embed, text, text_len, qvec);
     if (rc == 0)
         rc = kanbudb_vec_search(internal->vec_index, qvec, k, results);
     free(qvec);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -964,13 +1017,13 @@ int db_vec_search(db_t* db, const float* query,
 {
     if (!db || !query || !results || k == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     int rc = kanbudb_vec_search(internal->vec_index, query, k, results);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -978,13 +1031,13 @@ int db_vec_delete(db_t* db, uint64_t id)
 {
     if (!db) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     int rc = kanbudb_vec_delete(internal->vec_index, id);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -992,9 +1045,9 @@ int db_vec_count(db_t* db)
 {
     if (!db) return 0;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     int c = internal->vec_index ? kanbudb_vec_count(internal->vec_index) : 0;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return c;
 }
 
@@ -1002,13 +1055,13 @@ int db_vec_flush(db_t* db)
 {
     if (!db) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     int rc = kanbudb_vec_flush(internal->vec_index);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -1016,11 +1069,11 @@ int db_vec_set_embed(db_t* db, kanbudb_embed_t* embed)
 {
     if (!db || !embed) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
     if (internal->embed) kanbudb_embed_destroy(internal->embed);
     internal->embed = embed;
     internal->last_error = KANBUDB_OK;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_OK;
 }
 
@@ -1032,14 +1085,14 @@ int db_vec_search_filtered(db_t* db, const float* query, uint32_t k,
 {
     if (!db || !query || !results || k == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     int rc = kanbudb_vec_search_filtered(internal->vec_index, query, k,
                                          filter, filter_ctx, results);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -1050,20 +1103,20 @@ int db_vec_search_text_filtered(db_t* db, const char* text, size_t text_len,
 {
     if (!db || !text || !results || k == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->vec_index || !internal->embed) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     uint32_t dim = kanbudb_embed_dimensions(internal->embed);
     float* qvec = (float*)malloc((size_t)dim * sizeof(float));
-    if (!qvec) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!qvec) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
     int rc = kanbudb_embed_text(internal->embed, text, text_len, qvec);
     if (rc == 0)
         rc = kanbudb_vec_search_filtered(internal->vec_index, qvec, k,
                                          filter, filter_ctx, results);
     free(qvec);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc;
 }
 
@@ -1079,10 +1132,10 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         return KANBUDB_ERR_INVAL;
 
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
 
     if (!internal->vec_index || !internal->fts_index) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
 
@@ -1144,7 +1197,7 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
             (size_t)(vec_count + fts_count) * sizeof(kanbudb_hybrid_result_t));
         if (!merged) {
             free(vec_results);
-            pthread_rwlock_unlock(&internal->rwlock);
+            pthread_rwlock_unlock(&internal->table_lock);
             return KANBUDB_ERR_OOM;
         }
 
@@ -1200,7 +1253,7 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
 
     free(merged);
     free(vec_results);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return out_count;
 }
 
@@ -1210,7 +1263,7 @@ int db_vec_quant_create(db_t* db, const kanbudb_quant_params_t* params)
 {
     if (!db || !params) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
 
     if (internal->quantizer) kanbudb_quant_destroy(internal->quantizer);
     internal->quantizer = NULL;
@@ -1221,7 +1274,7 @@ int db_vec_quant_create(db_t* db, const kanbudb_quant_params_t* params)
 
     int rc = kanbudb_quant_create(&qparams, &internal->quantizer);
     if (rc != 0) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_OOM;
     }
 
@@ -1232,7 +1285,7 @@ int db_vec_quant_create(db_t* db, const kanbudb_quant_params_t* params)
     internal->quant_ids = (uint64_t*)calloc(internal->quant_capacity, sizeof(uint64_t));
 
     internal->last_error = KANBUDB_OK;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_OK;
 }
 
@@ -1240,7 +1293,7 @@ void db_vec_quant_destroy(db_t* db)
 {
     if (!db) return;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
     if (internal->quantizer) {
         kanbudb_quant_destroy(internal->quantizer);
         internal->quantizer = NULL;
@@ -1251,20 +1304,20 @@ void db_vec_quant_destroy(db_t* db)
     internal->quant_ids = NULL;
     internal->quant_count = 0;
     internal->quant_capacity = 0;
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
 }
 
 int db_vec_quant_train(db_t* db, const float* vectors, uint32_t count)
 {
     if (!db || !vectors || count == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
     if (!internal->quantizer) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
     int rc = kanbudb_quant_train(internal->quantizer, vectors, count);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return rc == 0 ? KANBUDB_OK : KANBUDB_ERR_IO;
 }
 
@@ -1272,9 +1325,9 @@ int db_vec_quant_insert(db_t* db, uint64_t id, const float* vector)
 {
     if (!db || !vector) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_wrlock(&internal->rwlock);
+    pthread_rwlock_wrlock(&internal->table_lock);
     if (!internal->quantizer) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
 
@@ -1287,7 +1340,7 @@ int db_vec_quant_insert(db_t* db, uint64_t id, const float* vector)
             (size_t)new_cap * sizeof(uint64_t));
         if (!new_vecs || !new_ids) {
             free(new_vecs); free(new_ids);
-            pthread_rwlock_unlock(&internal->rwlock);
+            pthread_rwlock_unlock(&internal->table_lock);
             return KANBUDB_ERR_OOM;
         }
         internal->quant_vectors = new_vecs;
@@ -1305,7 +1358,7 @@ int db_vec_quant_insert(db_t* db, uint64_t id, const float* vector)
         kanbudb_vec_insert(internal->vec_index, id, vector);
     }
 
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_OK;
 }
 
@@ -1314,9 +1367,9 @@ int db_vec_quant_search(db_t* db, const float* query, uint32_t k,
 {
     if (!db || !query || !results || k == 0) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->quantizer) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
 
@@ -1325,17 +1378,17 @@ int db_vec_quant_search(db_t* db, const float* query, uint32_t k,
 
     /* Encode query */
     uint8_t* qcode = (uint8_t*)malloc(code_size);
-    if (!qcode) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!qcode) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
     kanbudb_quant_encode(internal->quantizer, query, qcode, NULL);
 
     /* Scan all quantized vectors, compute approximate distances */
     uint32_t n = internal->quant_count;
     if (k > n) k = n;
-    if (n == 0) { free(qcode); pthread_rwlock_unlock(&internal->rwlock); return 0; }
+    if (n == 0) { free(qcode); pthread_rwlock_unlock(&internal->table_lock); return 0; }
 
     /* Simple scan with approximate distance */
     kanbudb_vec_result_t* tmp = (kanbudb_vec_result_t*)malloc(n * sizeof(kanbudb_vec_result_t));
-    if (!tmp) { free(qcode); pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!tmp) { free(qcode); pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
 
     for (uint32_t i = 0; i < n; i++) {
         uint8_t* vcode = (uint8_t*)malloc(code_size);
@@ -1365,7 +1418,7 @@ int db_vec_quant_search(db_t* db, const float* query, uint32_t k,
 
     free(tmp);
     free(qcode);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return (int)k;
 }
 
@@ -1373,9 +1426,9 @@ int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
 {
     if (!db || !out_vector) return KANBUDB_ERR_INVAL;
     struct kanbudb_db* internal = (struct kanbudb_db*)db;
-    pthread_rwlock_rdlock(&internal->rwlock);
+    pthread_rwlock_rdlock(&internal->table_lock);
     if (!internal->quantizer) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_INVAL;
     }
 
@@ -1385,7 +1438,7 @@ int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
         if (internal->quant_ids[i] == id) { idx = (int)i; break; }
     }
     if (idx < 0) {
-        pthread_rwlock_unlock(&internal->rwlock);
+        pthread_rwlock_unlock(&internal->table_lock);
         return KANBUDB_ERR_NOTFOUND;
     }
 
@@ -1393,7 +1446,7 @@ int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
     uint32_t code_size = kanbudb_quant_code_size(internal->quantizer);
 
     uint8_t* code = (uint8_t*)malloc(code_size);
-    if (!code) { pthread_rwlock_unlock(&internal->rwlock); return KANBUDB_ERR_OOM; }
+    if (!code) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
 
     kanbudb_quant_encode(internal->quantizer,
                          internal->quant_vectors + (size_t)idx * dim,
@@ -1401,6 +1454,6 @@ int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
     kanbudb_quant_decode(internal->quantizer, code, code_size, out_vector);
 
     free(code);
-    pthread_rwlock_unlock(&internal->rwlock);
+    pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_OK;
 }

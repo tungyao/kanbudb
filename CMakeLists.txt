@@ -10,6 +10,7 @@ set(KANBUDB_SOURCES
   src/util/arena.c
   src/util/page_cache.c
   src/util/fst.c
+  src/util/bloom.c
   src/storage/wal.c
   src/storage/lsm.c
   src/storage/btree.c
@@ -41,6 +42,20 @@ target_include_directories(kanbudb_shared PUBLIC include src/util src/storage sr
 find_package(Threads REQUIRED)
 target_link_libraries(kanbudb_static PRIVATE Threads::Threads m)
 target_link_libraries(kanbudb_shared PRIVATE Threads::Threads m)
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBURING liburing QUIET)
+  if(LIBURING_FOUND)
+    target_compile_definitions(kanbudb_static PUBLIC KANBUDB_HAVE_IOURING)
+    target_compile_definitions(kanbudb_shared PUBLIC KANBUDB_HAVE_IOURING)
+    target_include_directories(kanbudb_static PUBLIC ${LIBURING_INCLUDE_DIRS})
+    target_include_directories(kanbudb_shared PUBLIC ${LIBURING_INCLUDE_DIRS})
+    target_link_libraries(kanbudb_static PUBLIC ${LIBURING_LIBRARIES})
+    target_link_libraries(kanbudb_shared PUBLIC ${LIBURING_LIBRARIES})
+    message(STATUS "liburing found — io_uring WAL enabled")
+  endif()
+endif()
 
 if(KANBUDB_BUILD_TESTS)
   enable_testing()

@@ -218,8 +218,10 @@ static int pq_decode(const kanbudb_quantizer_t* q, const uint8_t* code, float* o
     return 0;
 }
 
-static float pq_distance(const kanbudb_quantizer_t* q,
-                          const uint8_t* a, const uint8_t* b)
+/* ── PQ distance: scalar fallback ──────────────────────── */
+
+static float pq_distance_scalar(const kanbudb_quantizer_t* q,
+                                 const uint8_t* a, const uint8_t* b)
 {
     uint32_t nsub = q->params.pq_subspaces;
     uint32_t sub_dim = q->pq_sub_dim;
@@ -234,6 +236,74 @@ static float pq_distance(const kanbudb_quantizer_t* q,
         }
     }
     return sum;
+}
+
+/* ── PQ distance: AVX2 (8-wide) ───────────────────────── */
+
+#ifdef __AVX2__
+#include <immintrin.h>
+
+static float pq_distance_avx2(const kanbudb_quantizer_t* q,
+                               const uint8_t* a, const uint8_t* b)
+{
+    uint32_t nsub = q->params.pq_subspaces;
+    uint32_t sub_dim = q->pq_sub_dim;
+    uint32_t vec_loops = sub_dim / 8;
+    uint32_t tail_start = vec_loops * 8;
+    __m256 sum = _mm256_setzero_ps();
+    float tail = 0.0f;
+
+    for (uint32_t s = 0; s < nsub; s++) {
+        const float* ca = q->pq_codebooks[s] + a[s] * sub_dim;
+        const float* cb = q->pq_codebooks[s] + b[s] * sub_dim;
+
+        for (uint32_t d = 0; d < vec_loops * 8; d += 8) {
+            __m256 va = _mm256_loadu_ps(ca + d);
+            __m256 vb = _mm256_loadu_ps(cb + d);
+            __m256 diff = _mm256_sub_ps(va, vb);
+            sum = _mm256_fmadd_ps(diff, diff, sum);
+        }
+        for (uint32_t d = tail_start; d < sub_dim; d++) {
+            float diff = ca[d] - cb[d];
+            tail += diff * diff;
+        }
+    }
+
+    /* Horizontal sum of the 8-wide accumulator */
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s) + tail;
+}
+#else
+static float pq_distance_avx2(const kanbudb_quantizer_t* q,
+                               const uint8_t* a, const uint8_t* b)
+{
+    (void)q; (void)a; (void)b;
+    return pq_distance_scalar(q, a, b); /* fallback when AVX2 not compiled */
+}
+#endif
+
+/* ── PQ distance: runtime dispatch ─────────────────────── */
+
+static float pq_distance(const kanbudb_quantizer_t* q,
+                          const uint8_t* a, const uint8_t* b)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    /* Runtime CPU feature detection — no compile-time #ifdef needed */
+    static int avx2_checked = 0;
+    static int use_avx2 = 0;
+    if (!avx2_checked) {
+        avx2_checked = 1;
+        use_avx2 = __builtin_cpu_supports("avx2");
+    }
+    if (use_avx2) {
+        return pq_distance_avx2(q, a, b);
+    }
+#endif
+    return pq_distance_scalar(q, a, b);
 }
 
 /* ── Public API ─────────────────────────────────────────────── */
