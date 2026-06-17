@@ -31,6 +31,7 @@ set(KANBUDB_SOURCES
   src/vector/quantize.c
   src/vector/vec_filter.c
   src/hybrid/hybrid.c
+  src/multi/multi.c
 )
 
 add_library(kanbudb_static STATIC ${KANBUDB_SOURCES})
@@ -209,6 +210,16 @@ if(KANBUDB_BUILD_TESTS)
   target_include_directories(test_lock_stress PRIVATE src)
   target_link_libraries(test_lock_stress kanbudb_static Threads::Threads)
   add_test(NAME test_lock_stress COMMAND test_lock_stress)
+
+  add_executable(test_multi_process test/unit/test_multi_process.c)
+  target_include_directories(test_multi_process PRIVATE src)
+  target_link_libraries(test_multi_process kanbudb_static)
+  add_test(NAME test_multi_process COMMAND test_multi_process)
+
+  add_executable(test_multi_stress test/unit/test_multi_stress.c)
+  target_include_directories(test_multi_stress PRIVATE src)
+  target_link_libraries(test_multi_stress kanbudb_static)
+  add_test(NAME test_multi_stress COMMAND test_multi_stress)
 
   add_executable(test_sstable_bloom test/unit/test_sstable_bloom.c)
   target_include_directories(test_sstable_bloom PRIVATE src/storage src/util)

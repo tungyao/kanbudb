@@ -42,6 +42,7 @@ class _DbConfig(ctypes.Structure):
         ("cache_size", ctypes.c_size_t),
         ("memtable_size", ctypes.c_size_t),
         ("compaction_threads", ctypes.c_int),
+        ("multi_process", ctypes.c_int),
     ]
 
 class _FtsOptions(ctypes.Structure):
@@ -412,9 +413,11 @@ class Database:
     """KanbuDB embedded database handle."""
 
     def __init__(self, path: str, *, fsync: str = "periodic",
-                 cache_size: int = 0, memtable_size: int = 4 * 1024 * 1024):
+                 cache_size: int = 0, memtable_size: int = 4 * 1024 * 1024,
+                 multi_process: bool = True):
         fsync_map = {"none": 0, "periodic": 1, "always": 2}
-        cfg = _DbConfig(fsync_map.get(fsync, 1), cache_size, memtable_size, 1)
+        cfg = _DbConfig(fsync_map.get(fsync, 1), cache_size, memtable_size, 1,
+                        1 if multi_process else 0)
         self._ptr = ctypes.c_void_p()
         rc = _lib.db_open(path.encode(), ctypes.byref(cfg), ctypes.byref(self._ptr))
         if rc != KANBUDB_OK:
@@ -690,10 +693,13 @@ def open(path: str, **kw) -> Database:
     """Open (or create) a KanbuDB database.
 
     Args:
-        path: Database file path (creates path.wal + path.lsm).
+        path: Database file path (creates path.wal + path.lsm + path.shm + path.lock + path.manifest).
         fsync: "none", "periodic" (default), or "always".
         cache_size: Page cache size in bytes (0 = auto).
         memtable_size: Memtable size in bytes (default 4MB).
+        multi_process: Enable multi-process shared mode (default True).
+                       When True, multiple processes can read concurrently;
+                       writes are serialized via flock.
 
     Returns:
         Database instance.

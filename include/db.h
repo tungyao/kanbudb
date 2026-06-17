@@ -40,6 +40,7 @@ typedef struct db_config_t {
   size_t cache_size;
   size_t memtable_size;
   int compaction_threads;
+  int multi_process;      /* enable multi-process shared mode */
 } db_config_t;
 
 /* FTS options */

@@ -15,12 +15,13 @@
 #include "embedding.h"
 #include "quantize_internal.h"
 #include "vec_filter.h"
+#include "multi/multi.h"
 #include <unistd.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <fcntl.h>
+
 
 #define KANBUDB_SYSTEM_TABLE_SUFFIX ".system"
 #define KANBUDB_COMPACTION_THRESHOLD 4
@@ -29,7 +30,8 @@ static const db_config_t default_config = {
   KANBUDB_FSYNC_NONE,
   65536,
   65536,
-  1
+  1,
+  0
 };
 
 struct sstable_flush_ctx {
@@ -71,12 +73,6 @@ static int sstable_load_cb(const void* key, size_t key_len,
   return btree_put(db->btree, key, key_len, value, val_len);
 }
 
-/* ── Schema persistence ──────────────────────────────────────
- * System SSTable stores table definitions as:
- *   key = "table:N:name"  value = JSON-like schema string
- *   key = "tables_count"  value = count as string
- */
-
 static int schema_save_cb(const void* key, size_t key_len,
                            const void* value, size_t val_len,
                            uint8_t flag, void* ctx) {
@@ -95,7 +91,6 @@ static int db_save_schema(struct kanbudb_db* db) {
   sstable_writer_t* w = sstable_writer_create(tmp_path, sys_path, 0);
   if (!w) return KANBUDB_ERR_OOM;
 
-  /* Write count */
   char count_str[16];
   snprintf(count_str, sizeof(count_str), "%d", db->num_tables);
   sstable_writer_add(w, "tables_count", 13, count_str, strlen(count_str) + 1,
@@ -103,11 +98,9 @@ static int db_save_schema(struct kanbudb_db* db) {
 
   for (int i = 0; i < db->num_tables; i++) {
     kanbudb_table_t* t = &db->tables[i];
-    /* key = "table:NNN:name" */
     char key[128];
     snprintf(key, sizeof(key), "table:%d:%s", i, t->name);
 
-    /* value = "num_cols|pk_idx|col1_type:col1_name|col2_type:col2_name|..." */
     char val[2048];
     int pos = snprintf(val, sizeof(val), "%d|%d", t->num_cols, t->primary_key_idx);
     for (int j = 0; j < t->num_cols; j++) {
@@ -123,7 +116,6 @@ static int db_save_schema(struct kanbudb_db* db) {
   return rc;
 }
 
-/* Callback for loading schema from system SSTable */
 typedef struct {
   struct kanbudb_db* db;
   int error;
@@ -139,18 +131,16 @@ static int schema_load_cb(const void* key, size_t key_len,
   const char* v = (const char*)value;
 
   if (strcmp(k, "tables_count") == 0) {
-    return KANBUDB_OK; /* handled after full scan */
+    return KANBUDB_OK;
   }
 
   if (strncmp(k, "table:", 6) != 0) return KANBUDB_OK;
 
-  /* Parse: table:IDX:NAME */
   const char* name_start = k + 6;
   const char* name_colon = strchr(name_start, ':');
   if (!name_colon) return KANBUDB_OK;
   const char* table_name = name_colon + 1;
 
-  /* Parse value: num_cols|pk_idx|type:name|type:name|... */
   int num_cols, pk_idx;
   if (sscanf(v, "%d|%d", &num_cols, &pk_idx) < 2) return KANBUDB_OK;
 
@@ -169,7 +159,6 @@ static int schema_load_cb(const void* key, size_t key_len,
   t->col_names = (char**)malloc((size_t)num_cols * sizeof(char*));
   if (!t->col_types || !t->col_names) { lc->error = 1; return KANBUDB_ERR_OOM; }
 
-  /* Parse each type:name pair */
   const char* p = v;
   int consumed = 0;
   sscanf(p, "%d|%d%n", &num_cols, &pk_idx, &consumed);
@@ -190,8 +179,6 @@ static int schema_load_cb(const void* key, size_t key_len,
   return KANBUDB_OK;
 }
 
-/* ── Checkpoint: dump B-tree to SSTable ───────────────────── */
-
 static int btree_dump_cb(const void* key, size_t key_len,
                           const void* value, size_t val_len,
                           uint8_t flag, void* ctx) {
@@ -202,8 +189,6 @@ static int btree_dump_cb(const void* key, size_t key_len,
 }
 
 static int db_checkpoint(struct kanbudb_db* db) {
-  /* Dump B-tree contents to a checkpoint SSTable:
-   * {dbpath}.ckpt.{seq} */
   uint64_t seq = lsm_next_seq(db->lsm);
 
   char ckpt_path[512], tmp_path[512];
@@ -215,7 +200,6 @@ static int db_checkpoint(struct kanbudb_db* db) {
   sstable_writer_t* w = sstable_writer_create(tmp_path, ckpt_path, seq);
   if (!w) return KANBUDB_ERR_OOM;
 
-  /* Iterate B-tree via cursor */
   btree_cursor_t* cur = btree_cursor_create(db->btree);
   if (!cur) { sstable_writer_destroy(w); return KANBUDB_ERR_OOM; }
 
@@ -239,43 +223,64 @@ static int db_checkpoint(struct kanbudb_db* db) {
   return rc;
 }
 
-/* ── Background compaction worker ────────────────────────────── */
-
 static void* compact_worker(void* arg) {
   struct kanbudb_db* db = (struct kanbudb_db*)arg;
   while (db->compact_running) {
-    /* Sleep 5 seconds between compaction checks */
     for (int i = 0; i < 50 && db->compact_running; i++) {
-      usleep(100000); /* 100ms ticks, check running flag */
+      usleep(100000);
     }
     if (!db->compact_running) break;
 
     pthread_rwlock_wrlock(&db->table_lock);
     pthread_rwlock_wrlock(&db->lsm_lock);
     pthread_rwlock_wrlock(&db->btree_lock);
-    
+
     kanbudb_level_t levels[KANBUDB_MAX_LEVELS];
     compaction_scan_levels(db->path, levels, KANBUDB_MAX_LEVELS);
-    
+
     int src_level = compaction_pick_level(levels, KANBUDB_MAX_LEVELS);
     if (src_level >= 0 && levels[src_level].num_files > 0) {
       int dst_level = src_level + 1;
       uint64_t out_seq = lsm_next_seq(db->lsm);
-      
+
       char out_path[512];
       compaction_make_path(db->path, dst_level, out_seq, out_path, sizeof(out_path));
-      
+
+      if (db->multi_enabled) {
+        /* In multi-process mode, check reader slots before compacting */
+        uint64_t oldest = kanbudb_shm_oldest_active_reader(&db->shm);
+        int safe = 1;
+        for (int i = 0; i < levels[src_level].num_files; i++) {
+          uint64_t sst_seq = 0;
+          const char* dp = strrchr(levels[src_level].file_paths[i], '.');
+          if (dp) sst_seq = (uint64_t)atoll(dp + 1);
+          if (sst_seq >= oldest) { safe = 0; break; }
+        }
+        if (!safe) {
+          compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
+          pthread_rwlock_unlock(&db->btree_lock);
+          pthread_rwlock_unlock(&db->lsm_lock);
+          pthread_rwlock_unlock(&db->table_lock);
+          continue;
+        }
+      }
+
       int rc = compaction_merge_to_level(
           (const char**)levels[src_level].file_paths,
           levels[src_level].num_files,
           out_path, out_seq);
-      
+
       if (rc == KANBUDB_OK) {
-        /* Delete old files */
+        if (db->multi_enabled) {
+          kanbudb_manifest_add(&db->manifest, out_path, dst_level, out_seq);
+          for (int i = 0; i < levels[src_level].num_files; i++) {
+            kanbudb_manifest_remove(&db->manifest, levels[src_level].file_paths[i]);
+          }
+          kanbudb_shm_writer_flush_sstable(&db->shm);
+        }
         for (int i = 0; i < levels[src_level].num_files; i++) {
           unlink(levels[src_level].file_paths[i]);
         }
-        /* Load merged result into B-tree */
         sstable_reader_t* sr = sstable_reader_open(out_path);
         if (sr) {
           sstable_reader_scan(sr, &sstable_load_cb, db);
@@ -283,7 +288,7 @@ static void* compact_worker(void* arg) {
         }
       }
     }
-    
+
     compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
     pthread_rwlock_unlock(&db->btree_lock);
     pthread_rwlock_unlock(&db->lsm_lock);
@@ -292,45 +297,38 @@ static void* compact_worker(void* arg) {
   return NULL;
 }
 
-/* ── SSTable path comparison (sort by seq number) ─────────── */
-
 static int sst_path_cmp(const void* a, const void* b) {
   const char* pa = *(const char**)a;
   const char* pb = *(const char**)b;
-  /* Extract last numeric field after the final '.' */
   const char* da = strrchr(pa, '.');
-  const char* db = strrchr(pb, '.');
+  const char* dbc = strrchr(pb, '.');
   uint64_t sa = da ? (uint64_t)atoll(da + 1) : 0;
-  uint64_t sb = db ? (uint64_t)atoll(db + 1) : 0;
+  uint64_t sb = dbc ? (uint64_t)atoll(dbc + 1) : 0;
   if (sa < sb) return -1;
   if (sa > sb) return 1;
   return 0;
 }
 
-/* ── Persistent sequence counter for SSTable naming ───────── */
-
 static uint64_t db_persistent_seq(const char* db_path) {
   char seq_path[512];
   snprintf(seq_path, sizeof(seq_path), "%s.seq", db_path);
-  
+
   uint64_t seq = 0;
   FILE* f = fopen(seq_path, "rb");
   if (f) {
     if (fread(&seq, sizeof(seq), 1, f) != 1) seq = 0;
     fclose(f);
   }
-  
+
   seq++;
   f = fopen(seq_path, "wb");
   if (f) {
     fwrite(&seq, sizeof(seq), 1, f);
     fclose(f);
   }
-  
+
   return seq;
 }
-
-/* ── Flush memtable to SSTable, truncate WAL ──────────────── */
 
 static int db_flush_memtable(struct kanbudb_db* db) {
   if (!db) return KANBUDB_ERR_INVAL;
@@ -338,7 +336,6 @@ static int db_flush_memtable(struct kanbudb_db* db) {
   int rc = lsm_flush(db->lsm);
   if (rc != KANBUDB_OK) return rc;
 
-  /* Use a persistent monotonic sequence for SSTable naming */
   uint64_t seq = db_persistent_seq(db->path);
 
   char sst_path[512], tmp_path[512];
@@ -365,7 +362,11 @@ static int db_flush_memtable(struct kanbudb_db* db) {
   sstable_writer_destroy(w);
   if (rc != KANBUDB_OK) { lsm_destroy_flushing(db->lsm); return rc; }
 
-  /* Load into B-tree */
+  if (db->multi_enabled) {
+    kanbudb_manifest_add(&db->manifest, sst_path, 0, seq);
+    rc = KANBUDB_OK;
+  }
+
   sstable_reader_t* sr = sstable_reader_open(sst_path);
   if (sr) {
     sstable_reader_scan(sr, &sstable_load_cb, db);
@@ -374,10 +375,16 @@ static int db_flush_memtable(struct kanbudb_db* db) {
 
   lsm_destroy_flushing(db->lsm);
 
-  /* Truncate WAL — all flushed entries are now durable in SSTable+B-tree */
   wal_truncate(db->wal);
 
-  return KANBUDB_OK;
+  if (db->multi_enabled) {
+    db->shm.header->sstable_generation++;
+    db->shm.header->wal_checkpointed = KANBUDB_WAL_HEADER_SIZE;
+    db->shm.header->wal_committed_end = KANBUDB_WAL_HEADER_SIZE;
+    __sync_synchronize();
+  }
+
+  return rc;
 }
 
 static int find_table(struct kanbudb_db* db, const char* name) {
@@ -386,6 +393,68 @@ static int find_table(struct kanbudb_db* db, const char* name) {
       return i;
   }
   return -1;
+}
+
+/* ── Multi-process WAL apply callback ─────────────────────── */
+
+typedef struct {
+  struct kanbudb_db* db;
+  const void* search_key;
+  size_t search_key_len;
+  int found;
+  void** out_value;
+  size_t* out_val_len;
+} mp_wal_search_ctx_t;
+
+static int mp_wal_search_cb(const kanbudb_wal_frame_t* frame, void* ctx) {
+  mp_wal_search_ctx_t* sc = (mp_wal_search_ctx_t*)ctx;
+  if (sc->found) return 1;
+  if (frame->key_len == sc->search_key_len &&
+      memcmp(frame->key, sc->search_key, sc->search_key_len) == 0) {
+    if (frame->op == 1) {
+      sc->found = 2;
+    } else {
+      sc->found = 1;
+      if (sc->out_value && sc->out_val_len && frame->val_len > 0) {
+        *sc->out_value = malloc(frame->val_len);
+        if (*sc->out_value) {
+          memcpy(*sc->out_value, frame->value, frame->val_len);
+          *sc->out_val_len = frame->val_len;
+        }
+      }
+    }
+    return 1;
+  }
+  return 0;
+}
+
+/* ── Multi-process helpers ────────────────────────────────── */
+
+static uint64_t mp_wal_end(struct kanbudb_db* db) {
+  return db->shm.header->wal_committed_end;
+}
+
+static void mp_ensure_reader_registered(struct kanbudb_db* db) {
+  if (db->reader_slot_info == UINT64_MAX) {
+    db->reader_slot_info = kanbudb_shm_reader_register(&db->shm);
+  }
+}
+
+static int mp_load_sstables_from_manifest(struct kanbudb_db* db) {
+  btree_destroy(db->btree);
+  db->btree = btree_create();
+  if (!db->btree) return KANBUDB_ERR_OOM;
+
+  kanbudb_manifest_reload(&db->manifest);
+  for (int i = 0; i < db->manifest.num_entries; i++) {
+    sstable_reader_t* sr = sstable_reader_open(db->manifest.paths[i]);
+    if (sr) {
+      sstable_reader_scan(sr, &sstable_load_cb, db);
+      sstable_reader_close(sr);
+    }
+  }
+  db->cached_sstable_gen = db->shm.header->sstable_generation;
+  return KANBUDB_OK;
 }
 
 /* ── db_open ───────────────────────────────────────────────── */
@@ -400,6 +469,9 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
   if (!db->path) { free(db); return KANBUDB_ERR_OOM; }
 
   db->config = config ? *config : default_config;
+  db->multi_enabled = db->config.multi_process;
+  db->reader_slot_info = UINT64_MAX;
+  db->cached_commit_seq = KANBUDB_WAL_HEADER_SIZE;
 
   char wal_path[512];
   snprintf(wal_path, sizeof(wal_path), "%s.wal", path);
@@ -423,7 +495,20 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
   db->num_tables = 0;
   db->last_error = KANBUDB_OK;
 
-  /* Phase 1: load system table (schema) */
+  if (db->multi_enabled) {
+    db->lock_fd = kanbudb_lock_open(path);
+    if (db->lock_fd < 0) { btree_destroy(db->btree); lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return KANBUDB_ERR_IO; }
+
+    int rc = kanbudb_shm_open(path, &db->shm);
+    if (rc != KANBUDB_OK) { close(db->lock_fd); btree_destroy(db->btree); lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return rc; }
+
+    rc = kanbudb_manifest_open(path, &db->manifest);
+    if (rc != KANBUDB_OK) { kanbudb_shm_close(&db->shm); close(db->lock_fd); btree_destroy(db->btree); lsm_destroy(db->lsm); wal_destroy(db->wal); free(db->path); free(db); return rc; }
+
+    kanbudb_lock_shared(db->lock_fd);
+    mp_ensure_reader_registered(db);
+  }
+
   {
     char sys_path[512];
     snprintf(sys_path, sizeof(sys_path), "%s%s", path, KANBUDB_SYSTEM_TABLE_SUFFIX);
@@ -437,12 +522,12 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
     }
   }
 
-  /* Phase 2: load data SSTables into B-tree (leveled order) */
-  {
+  if (db->multi_enabled) {
+    mp_load_sstables_from_manifest(db);
+  } else {
     kanbudb_level_t levels[KANBUDB_MAX_LEVELS];
     compaction_scan_levels(path, levels, KANBUDB_MAX_LEVELS);
 
-    /* Load from L0 → L1 → ... → L7 so higher-level (more compacted) data wins */
     for (int lvl = 0; lvl < KANBUDB_MAX_LEVELS; lvl++) {
       for (int i = 0; i < levels[lvl].num_files; i++) {
         sstable_reader_t* sr = sstable_reader_open(levels[lvl].file_paths[i]);
@@ -455,16 +540,22 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
     compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
   }
 
-  /* Phase 3: start background compaction thread */
   {
     db->compact_running = 1;
     db->compact_trigger = 0;
     pthread_create(&db->compact_thread, NULL, compact_worker, db);
   }
 
-  /* Phase 4: replay WAL for any unflushed writes */
-  {
+  /* In multi-process mode, WAL uses frame format (not old-format records),
+   * so wal_replay (which reads old-format records) would misinterpret frame
+   * data, corrupt the LSM with garbage, and trigger a flush + wal_truncate
+   * on close that destroys frames visible to other processes. */
+  if (!db->multi_enabled) {
     wal_replay(db->wal, &wal_replay_cb, db);
+  }
+
+  if (db->multi_enabled) {
+    kanbudb_unlock(db->lock_fd);
   }
 
   *out = db;
@@ -477,27 +568,29 @@ int db_close(db_t* db) {
   if (!db) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
 
-  /* Acquire all locks in order */
   pthread_rwlock_wrlock(&internal->table_lock);
   pthread_mutex_lock(&internal->wal_lock);
   pthread_rwlock_wrlock(&internal->lsm_lock);
   pthread_rwlock_wrlock(&internal->btree_lock);
 
-  /* Stop background compaction */
   internal->compact_running = 0;
   pthread_join(internal->compact_thread, NULL);
 
-  /* Flush any remaining data in memtable */
   if (lsm_has_data(internal->lsm)) {
     db_flush_memtable(internal);
   }
 
-  /* Save schema to system table */
+  if (internal->multi_enabled) {
+    if (internal->reader_slot_info != UINT64_MAX) {
+      kanbudb_shm_reader_unregister(&internal->shm,
+                                     internal->reader_slot_info & 0xFFFFFFFF);
+    }
+  }
+
   if (internal->num_tables > 0) {
     db_save_schema(internal);
   }
 
-  /* Take a checkpoint of the B-tree */
   db_checkpoint(internal);
 
   for (int i = 0; i < internal->num_tables; i++) {
@@ -520,6 +613,13 @@ int db_close(db_t* db) {
   btree_destroy(internal->btree);
   lsm_destroy(internal->lsm);
   wal_destroy(internal->wal);
+
+  if (internal->multi_enabled) {
+    kanbudb_manifest_close(&internal->manifest);
+    kanbudb_shm_close(&internal->shm);
+    kanbudb_lock_close(internal->lock_fd);
+  }
+
   free(internal->path);
 
   pthread_rwlock_unlock(&internal->table_lock);
@@ -612,13 +712,35 @@ int db_create_table(db_t* db, const char* table_name,
   t->id = (uint64_t)(internal->num_tables + 1);
   internal->num_tables++;
 
-  /* Persist schema immediately */
   db_save_schema(internal);
 
   internal->last_error = KANBUDB_OK;
   pthread_rwlock_unlock(&internal->table_lock);
   return KANBUDB_OK;
 }
+
+/* ── Multi-process read refresh ──────────────────────────── */
+
+static int mp_refresh_reader_view(struct kanbudb_db* db) {
+  if (!db->multi_enabled) return KANBUDB_OK;
+
+  mp_ensure_reader_registered(db);
+
+  uint64_t gen = db->shm.header->sstable_generation;
+  if (gen != db->cached_sstable_gen) {
+    pthread_rwlock_wrlock(&db->btree_lock);
+    mp_load_sstables_from_manifest(db);
+    uint64_t ckpt = db->shm.header->wal_checkpointed;
+    db->cached_commit_seq = ckpt > KANBUDB_WAL_HEADER_SIZE
+                            ? ckpt : KANBUDB_WAL_HEADER_SIZE;
+    db->cached_sstable_gen = gen;
+    pthread_rwlock_unlock(&db->btree_lock);
+  }
+
+  return KANBUDB_OK;
+}
+
+/* ── db_put ────────────────────────────────────────────────── */
 
 int db_put(db_t* db, const char* table, const char* key, size_t key_len,
            const void* value, size_t value_len) {
@@ -636,33 +758,47 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
   uint64_t tbl_id = internal->tables[idx].id;
   pthread_rwlock_unlock(&internal->table_lock);
 
+  if (internal->multi_enabled) {
+    kanbudb_lock_exclusive(internal->lock_fd);
+  }
+
   pthread_mutex_lock(&internal->wal_lock);
-  int rc = wal_append(internal->wal, KANBUDB_WAL_PUT,
-                       tbl_id,
-                       key, key_len, value, value_len);
+
+  int rc;
+  if (internal->multi_enabled) {
+    uint64_t seq = wal_last_seq(internal->wal) + 1;
+    rc = kanbudb_wal_append_frame(internal->wal, seq,
+                                   KANBUDB_WAL_PUT,
+                                   tbl_id, key, key_len,
+                                   value, value_len);
+  } else {
+    rc = wal_append(internal->wal, KANBUDB_WAL_PUT,
+                     tbl_id, key, key_len, value, value_len);
+  }
   pthread_mutex_unlock(&internal->wal_lock);
   if (rc != KANBUDB_OK) {
+    if (internal->multi_enabled) kanbudb_unlock(internal->lock_fd);
     internal->last_error = rc;
     return rc;
   }
 
   pthread_rwlock_wrlock(&internal->lsm_lock);
-  rc = lsm_put(internal->lsm, tbl_id,
-                key, key_len, value, value_len);
+  rc = lsm_put(internal->lsm, tbl_id, key, key_len, value, value_len);
   if (rc != KANBUDB_OK) {
     pthread_rwlock_unlock(&internal->lsm_lock);
+    if (internal->multi_enabled) kanbudb_unlock(internal->lock_fd);
     internal->last_error = rc;
     return rc;
   }
 
   int need_flush = lsm_is_full(internal->lsm);
   if (need_flush) {
-    /* Upgrade to btree lock for flush, then flush */
     pthread_rwlock_wrlock(&internal->btree_lock);
     int frc = db_flush_memtable(internal);
     pthread_rwlock_unlock(&internal->btree_lock);
     pthread_rwlock_unlock(&internal->lsm_lock);
     if (frc != KANBUDB_OK) {
+      if (internal->multi_enabled) kanbudb_unlock(internal->lock_fd);
       internal->last_error = frc;
       return frc;
     }
@@ -670,9 +806,18 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
     pthread_rwlock_unlock(&internal->lsm_lock);
   }
 
+  if (internal->multi_enabled) {
+    internal->shm.header->commit_seq++;
+    internal->shm.header->wal_committed_end = kanbudb_wal_file_size(internal->wal);
+    __sync_synchronize();
+    kanbudb_unlock(internal->lock_fd);
+  }
+
   internal->last_error = KANBUDB_OK;
   return KANBUDB_OK;
 }
+
+/* ── db_get ────────────────────────────────────────────────── */
 
 int db_get(db_t* db, const char* table, const char* key, size_t key_len,
            void** value, size_t* value_len) {
@@ -690,19 +835,57 @@ int db_get(db_t* db, const char* table, const char* key, size_t key_len,
   uint64_t tbl_id = internal->tables[idx].id;
   pthread_rwlock_unlock(&internal->table_lock);
 
+  if (internal->multi_enabled) {
+    mp_refresh_reader_view(internal);
+  }
+
   pthread_rwlock_rdlock(&internal->lsm_lock);
-  int rc = lsm_get(internal->lsm, tbl_id,
-                    key, key_len, value, value_len);
+  int rc = lsm_get(internal->lsm, tbl_id, key, key_len, value, value_len);
   pthread_rwlock_unlock(&internal->lsm_lock);
   if (rc == KANBUDB_OK) {
+    void* owned = malloc(*value_len);
+    if (owned) { memcpy(owned, *value, *value_len); *value = owned; }
     internal->last_error = KANBUDB_OK;
     return KANBUDB_OK;
+  }
+
+  if (internal->multi_enabled) {
+    char wal_path[512];
+    snprintf(wal_path, sizeof(wal_path), "%s.wal", internal->path);
+
+    uint64_t checkpointed = internal->shm.header->wal_checkpointed;
+    uint64_t committed = internal->shm.header->wal_committed_end;
+    uint64_t scan_start = internal->cached_commit_seq > checkpointed
+                          ? internal->cached_commit_seq : checkpointed;
+
+    if (committed > scan_start) {
+      mp_wal_search_ctx_t sc;
+      memset(&sc, 0, sizeof(sc));
+      sc.db = internal;
+      sc.search_key = key;
+      sc.search_key_len = key_len;
+      sc.out_value = value;
+      sc.out_val_len = value_len;
+
+      kanbudb_wal_scan_frames(wal_path, scan_start, committed,
+                               &mp_wal_search_cb, &sc);
+      if (sc.found == 1) {
+        internal->last_error = KANBUDB_OK;
+        return KANBUDB_OK;
+      }
+      if (sc.found == 2) {
+        internal->last_error = KANBUDB_ERR_NOTFOUND;
+        return KANBUDB_ERR_NOTFOUND;
+      }
+    }
   }
 
   pthread_rwlock_rdlock(&internal->btree_lock);
   rc = btree_get(internal->btree, key, key_len, value, value_len);
   pthread_rwlock_unlock(&internal->btree_lock);
   if (rc == KANBUDB_OK) {
+    void* owned = malloc(*value_len);
+    if (owned) { memcpy(owned, *value, *value_len); *value = owned; }
     internal->last_error = KANBUDB_OK;
     return KANBUDB_OK;
   }
@@ -710,6 +893,8 @@ int db_get(db_t* db, const char* table, const char* key, size_t key_len,
   internal->last_error = KANBUDB_ERR_NOTFOUND;
   return KANBUDB_ERR_NOTFOUND;
 }
+
+/* ── db_delete ─────────────────────────────────────────────── */
 
 int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
   if (!db || !table || !key) return KANBUDB_ERR_INVAL;
@@ -726,12 +911,25 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
   uint64_t tbl_id = internal->tables[idx].id;
   pthread_rwlock_unlock(&internal->table_lock);
 
+  if (internal->multi_enabled) {
+    kanbudb_lock_exclusive(internal->lock_fd);
+  }
+
   pthread_mutex_lock(&internal->wal_lock);
-  int rc = wal_append(internal->wal, KANBUDB_WAL_DELETE,
-                       tbl_id,
-                       key, key_len, NULL, 0);
+
+  int rc;
+  if (internal->multi_enabled) {
+    uint64_t seq = wal_last_seq(internal->wal) + 1;
+    rc = kanbudb_wal_append_frame(internal->wal, seq,
+                                   KANBUDB_WAL_DELETE,
+                                   tbl_id, key, key_len, NULL, 0);
+  } else {
+    rc = wal_append(internal->wal, KANBUDB_WAL_DELETE,
+                     tbl_id, key, key_len, NULL, 0);
+  }
   pthread_mutex_unlock(&internal->wal_lock);
   if (rc != KANBUDB_OK) {
+    if (internal->multi_enabled) kanbudb_unlock(internal->lock_fd);
     internal->last_error = rc;
     return rc;
   }
@@ -740,6 +938,7 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
   rc = lsm_delete(internal->lsm, tbl_id, key, key_len);
   if (rc != KANBUDB_OK) {
     pthread_rwlock_unlock(&internal->lsm_lock);
+    if (internal->multi_enabled) kanbudb_unlock(internal->lock_fd);
     internal->last_error = rc;
     return rc;
   }
@@ -751,11 +950,19 @@ int db_delete(db_t* db, const char* table, const char* key, size_t key_len) {
     pthread_rwlock_unlock(&internal->btree_lock);
     pthread_rwlock_unlock(&internal->lsm_lock);
     if (frc != KANBUDB_OK) {
+      if (internal->multi_enabled) kanbudb_unlock(internal->lock_fd);
       internal->last_error = frc;
       return frc;
     }
   } else {
     pthread_rwlock_unlock(&internal->lsm_lock);
+  }
+
+  if (internal->multi_enabled) {
+    internal->shm.header->commit_seq++;
+    internal->shm.header->wal_committed_end = kanbudb_wal_file_size(internal->wal);
+    __sync_synchronize();
+    kanbudb_unlock(internal->lock_fd);
   }
 
   internal->last_error = KANBUDB_OK;
@@ -870,8 +1077,6 @@ int db_fts_search(db_t* db, const char* table, const char* column,
   pthread_rwlock_unlock(&internal->table_lock);
   return KANBUDB_OK;
 }
-
-/* ── Vector index + built-in embedding ─────────────────────── */
 
 int db_vec_create_index(db_t* db, const db_vec_options_t* opts)
 {
@@ -1077,8 +1282,6 @@ int db_vec_set_embed(db_t* db, kanbudb_embed_t* embed)
     return KANBUDB_OK;
 }
 
-/* ── Filtered vector search ─────────────────────────────────── */
-
 int db_vec_search_filtered(db_t* db, const float* query, uint32_t k,
                            db_vec_filter_fn filter, void* filter_ctx,
                            kanbudb_vec_result_t* results)
@@ -1120,8 +1323,6 @@ int db_vec_search_text_filtered(db_t* db, const char* text, size_t text_len,
     return rc;
 }
 
-/* ── Hybrid search (vector + FTS fusion) ────────────────────── */
-
 int db_hybrid_search(db_t* db, const char* table, const char* column,
                      const char* fts_query, const float* vec_query,
                      const kanbudb_hybrid_params_t* params,
@@ -1139,7 +1340,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         return KANBUDB_ERR_INVAL;
     }
 
-    /* 1. Vector search */
     uint32_t vec_k = params->k > 0 ? params->k : 10;
     kanbudb_vec_result_t* vec_results = NULL;
     int vec_count = 0;
@@ -1152,7 +1352,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         }
     }
 
-    /* 2. FTS search */
     fts_query_node_t nodes[64];
     int num_nodes = fts_query_parse(fts_query, nodes, 64);
 
@@ -1188,7 +1387,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         }
     }
 
-    /* 3. Merge results with RRF */
     kanbudb_hybrid_result_t* merged = NULL;
     int merged_count = 0;
 
@@ -1202,7 +1400,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         }
 
         const double k = 60.0;
-        /* Add vector results */
         for (int i = 0; i < vec_count; i++) {
             merged[merged_count].id = vec_results[i].id;
             merged[merged_count].vec_distance = (double)vec_results[i].distance;
@@ -1211,14 +1408,12 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
             merged_count++;
         }
 
-        /* Add FTS results */
         for (int i = 0; i < fts_count; i++) {
             int found = -1;
             for (int j = 0; j < merged_count; j++) {
                 if (merged[j].id == fts_ids_buf[i]) { found = j; break; }
             }
             if (found >= 0) {
-                /* Boost existing entry */
                 merged[found].fts_score = fts_scores_buf[i];
                 merged[found].score += params->fts_weight * (1.0 / (k + (double)(i + 1)));
             } else {
@@ -1231,8 +1426,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         }
     }
 
-    /* Sort by score descending */
-    /* Simple selection sort for small result sets */
     for (int i = 0; i < merged_count - 1; i++) {
         int best = i;
         for (int j = i + 1; j < merged_count; j++) {
@@ -1245,7 +1438,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
         }
     }
 
-    /* Output top results */
     int out_count = merged_count < max_results ? merged_count : max_results;
     for (int i = 0; i < out_count; i++) {
         results[i] = merged[i];
@@ -1256,8 +1448,6 @@ int db_hybrid_search(db_t* db, const char* table, const char* column,
     pthread_rwlock_unlock(&internal->table_lock);
     return out_count;
 }
-
-/* ── Vector quantization ────────────────────────────────────── */
 
 int db_vec_quant_create(db_t* db, const kanbudb_quant_params_t* params)
 {
@@ -1353,7 +1543,6 @@ int db_vec_quant_insert(db_t* db, uint64_t id, const float* vector)
     internal->quant_ids[internal->quant_count] = id;
     internal->quant_count++;
 
-    /* Also insert into the raw vector index if available */
     if (internal->vec_index) {
         kanbudb_vec_insert(internal->vec_index, id, vector);
     }
@@ -1376,17 +1565,14 @@ int db_vec_quant_search(db_t* db, const float* query, uint32_t k,
     uint32_t dim = internal->quantizer->params.dimension;
     uint32_t code_size = kanbudb_quant_code_size(internal->quantizer);
 
-    /* Encode query */
     uint8_t* qcode = (uint8_t*)malloc(code_size);
     if (!qcode) { pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
     kanbudb_quant_encode(internal->quantizer, query, qcode, NULL);
 
-    /* Scan all quantized vectors, compute approximate distances */
     uint32_t n = internal->quant_count;
     if (k > n) k = n;
     if (n == 0) { free(qcode); pthread_rwlock_unlock(&internal->table_lock); return 0; }
 
-    /* Simple scan with approximate distance */
     kanbudb_vec_result_t* tmp = (kanbudb_vec_result_t*)malloc(n * sizeof(kanbudb_vec_result_t));
     if (!tmp) { free(qcode); pthread_rwlock_unlock(&internal->table_lock); return KANBUDB_ERR_OOM; }
 
@@ -1403,7 +1589,6 @@ int db_vec_quant_search(db_t* db, const float* query, uint32_t k,
         free(vcode);
     }
 
-    /* Partial sort for top-K */
     for (uint32_t i = 0; i < k; i++) {
         uint32_t best = i;
         for (uint32_t j = i + 1; j < n; j++) {
@@ -1432,7 +1617,6 @@ int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
         return KANBUDB_ERR_INVAL;
     }
 
-    /* Find the ID */
     int idx = -1;
     for (uint32_t i = 0; i < internal->quant_count; i++) {
         if (internal->quant_ids[i] == id) { idx = (int)i; break; }
@@ -1456,4 +1640,11 @@ int db_vec_quant_decode(db_t* db, uint64_t id, float* out_vector)
     free(code);
     pthread_rwlock_unlock(&internal->table_lock);
     return KANBUDB_OK;
+}
+
+/* ── Multi-process sstable_generation update ──────────────── */
+
+void kanbudb_shm_writer_flush_sstable(kanbudb_shm_t* shm) {
+    shm->header->sstable_generation++;
+    __sync_synchronize();
 }

@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include "fts/index.h"
 #include "vector.h"
+#include "multi/multi.h"
 
 #define KANBUDB_MAX_TABLES 64
 
@@ -39,11 +40,21 @@ struct kanbudb_db {
   uint64_t*            quant_ids;
   uint32_t             quant_count;
   uint32_t             quant_capacity;
+
+  /* Multi-process state */
+  int                  multi_enabled;
+  int                  lock_fd;
+  kanbudb_shm_t        shm;
+  kanbudb_manifest_t   manifest;
+  uint64_t             cached_sstable_gen;
+  uint64_t             cached_commit_seq;
+  uint64_t             reader_slot_info; /* slot|gen<<32 or UINT64_MAX */
+
   /* Fine-grained locking (lock order: table < wal < lsm < btree) */
-  pthread_rwlock_t     table_lock;   /* tables[] / schema */
-  pthread_mutex_t      wal_lock;     /* WAL append serialization */
-  pthread_rwlock_t     lsm_lock;     /* LSM memtable */
-  pthread_rwlock_t     btree_lock;   /* B-tree */
+  pthread_rwlock_t     table_lock;
+  pthread_mutex_t      wal_lock;
+  pthread_rwlock_t     lsm_lock;
+  pthread_rwlock_t     btree_lock;
   /* Background compaction */
   pthread_t            compact_thread;
   int                  compact_running;
