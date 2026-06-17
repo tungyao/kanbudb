@@ -401,31 +401,38 @@ typedef struct {
   struct kanbudb_db* db;
   const void* search_key;
   size_t search_key_len;
-  int found;
+  int found;           /* 0=none, 1=alive, 2=deleted */
   void** out_value;
   size_t* out_val_len;
+  void* _cached_value;   /* owned storage for last-matching value */
+  size_t _cached_val_len;
 } mp_wal_search_ctx_t;
 
 static int mp_wal_search_cb(const kanbudb_wal_frame_t* frame, void* ctx) {
   mp_wal_search_ctx_t* sc = (mp_wal_search_ctx_t*)ctx;
-  if (sc->found) return 1;
-  if (frame->key_len == sc->search_key_len &&
-      memcmp(frame->key, sc->search_key, sc->search_key_len) == 0) {
-    if (frame->op == 1) {
-      sc->found = 2;
-    } else {
-      sc->found = 1;
-      if (sc->out_value && sc->out_val_len && frame->val_len > 0) {
-        *sc->out_value = malloc(frame->val_len);
-        if (*sc->out_value) {
-          memcpy(*sc->out_value, frame->value, frame->val_len);
-          *sc->out_val_len = frame->val_len;
-        }
+  if (frame->key_len != sc->search_key_len ||
+      memcmp(frame->key, sc->search_key, sc->search_key_len) != 0)
+    return 0;
+  /* Scan ALL frames (oldest→newest) to keep the LATEST value for this key.
+   * The first match would be stale if the key was updated later. */
+  if (frame->op == 1) {
+    sc->found = 2;
+    free(sc->_cached_value);
+    sc->_cached_value = NULL;
+    sc->_cached_val_len = 0;
+  } else {
+    sc->found = 1;
+    free(sc->_cached_value);
+    sc->_cached_value = NULL;
+    if (frame->val_len > 0) {
+      sc->_cached_value = malloc(frame->val_len);
+      if (sc->_cached_value) {
+        memcpy(sc->_cached_value, frame->value, frame->val_len);
+        sc->_cached_val_len = frame->val_len;
       }
     }
-    return 1;
   }
-  return 0;
+  return 0; /* continue scanning for newer frames */
 }
 
 /* ── Multi-process helpers ────────────────────────────────── */
@@ -870,13 +877,19 @@ int db_get(db_t* db, const char* table, const char* key, size_t key_len,
       kanbudb_wal_scan_frames(wal_path, scan_start, committed,
                                &mp_wal_search_cb, &sc);
       if (sc.found == 1) {
+        if (sc._cached_value && sc._cached_val_len > 0) {
+          *value = sc._cached_value;
+          *value_len = sc._cached_val_len;
+        }
         internal->last_error = KANBUDB_OK;
         return KANBUDB_OK;
       }
       if (sc.found == 2) {
+        free(sc._cached_value);
         internal->last_error = KANBUDB_ERR_NOTFOUND;
         return KANBUDB_ERR_NOTFOUND;
       }
+      free(sc._cached_value);
     }
   }
 
