@@ -452,6 +452,10 @@ static int mp_load_sstables_from_manifest(struct kanbudb_db* db) {
   db->btree = btree_create();
   if (!db->btree) return KANBUDB_ERR_OOM;
 
+  /* The manifest file may have been atomically replaced (via rename) by
+   * another process.  Close the old fd and reopen to get the new inode. */
+  if (db->manifest.fd >= 0) close(db->manifest.fd);
+  db->manifest.fd = open(db->manifest.path, O_RDWR, 0644);
   kanbudb_manifest_reload(&db->manifest);
   for (int i = 0; i < db->manifest.num_entries; i++) {
     sstable_reader_t* sr = sstable_reader_open(db->manifest.paths[i]);
