@@ -184,6 +184,36 @@ if(KANBUDB_BUILD_TESTS)
   add_executable(bench_thread_safety test/bench/bench_thread_safety.c)
   target_include_directories(bench_thread_safety PRIVATE src/vector)
   target_link_libraries(bench_thread_safety kanbudb_static Threads::Threads m)
+
+  add_executable(test_bloom test/unit/test_bloom.c)
+  target_include_directories(test_bloom PRIVATE src/util)
+  target_link_libraries(test_bloom kanbudb_static m)
+  add_test(NAME test_bloom COMMAND test_bloom)
+
+  add_executable(test_wal_io test/unit/test_wal_io.c)
+  target_include_directories(test_wal_io PRIVATE src/util src/storage)
+  target_link_libraries(test_wal_io kanbudb_static)
+  add_test(NAME test_wal_io COMMAND test_wal_io)
+
+  add_executable(test_distance_simd test/unit/test_distance_simd.c)
+  target_include_directories(test_distance_simd PRIVATE src/vector src/util)
+  target_link_libraries(test_distance_simd kanbudb_static m)
+  add_test(NAME test_distance_simd COMMAND test_distance_simd)
+
+  add_executable(test_leveled_compact test/unit/test_leveled_compact.c)
+  target_include_directories(test_leveled_compact PRIVATE src/storage src/util)
+  target_link_libraries(test_leveled_compact kanbudb_static)
+  add_test(NAME test_leveled_compact COMMAND test_leveled_compact)
+
+  add_executable(test_lock_stress test/unit/test_lock_stress.c)
+  target_include_directories(test_lock_stress PRIVATE src)
+  target_link_libraries(test_lock_stress kanbudb_static Threads::Threads)
+  add_test(NAME test_lock_stress COMMAND test_lock_stress)
+
+  add_executable(test_sstable_bloom test/unit/test_sstable_bloom.c)
+  target_include_directories(test_sstable_bloom PRIVATE src/storage src/util)
+  target_link_libraries(test_sstable_bloom kanbudb_static)
+  add_test(NAME test_sstable_bloom COMMAND test_sstable_bloom)
 endif()
 
 add_custom_target(amalgamate

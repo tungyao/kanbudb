@@ -112,19 +112,21 @@ static int wal_flush_buf(kanbudb_wal_t* wal)
       wal->periodic_count = 0;
     }
 
-    /* Submit and wait for write completion */
-    int ret = io_uring_submit_and_wait(&wal->ring, 1);
-    if (ret < 0) return KANBUDB_ERR_IO;
-
-    struct io_uring_cqe* cqe;
-    unsigned head;
-    io_uring_for_each_cqe(&wal->ring, head, cqe) {
-      if (cqe->res < 0) {
-        io_uring_cqe_seen(&wal->ring, cqe);
-        wal->buf_len = 0;
-        return KANBUDB_ERR_IO;
-      }
+    /* Submit and wait for the write CQE (user_data=1) to complete.
+     * We must loop because fsync CQEs from this or prior submissions
+     * may appear before the write CQE. */
+    io_uring_submit(&wal->ring);
+    while (1) {
+      struct io_uring_cqe* cqe = NULL;
+      int ret = io_uring_wait_cqe(&wal->ring, &cqe);
+      if (ret < 0) return KANBUDB_ERR_IO;
+      int err = cqe->res;
+      uint64_t ud = cqe->user_data;
       io_uring_cqe_seen(&wal->ring, cqe);
+      if (ud == 1) {
+        if (err < 0) { wal->buf_len = 0; return KANBUDB_ERR_IO; }
+        break;
+      }
     }
 
     wal->file_pos += wal->buf_len;
@@ -314,14 +316,19 @@ int wal_sync(kanbudb_wal_t* wal)
     if (!sqe) return KANBUDB_ERR_BUSY;
     io_uring_prep_fsync(sqe, wal->fd, IORING_FSYNC_DATASYNC);
     sqe->user_data = 3;
-    io_uring_submit_and_wait(&wal->ring, 1);
-    struct io_uring_cqe* cqe;
-    unsigned head;
-    io_uring_for_each_cqe(&wal->ring, head, cqe) {
-      if (cqe->res < 0) { io_uring_cqe_seen(&wal->ring, cqe); return KANBUDB_ERR_IO; }
+    io_uring_submit(&wal->ring);
+    while (1) {
+      struct io_uring_cqe* cqe = NULL;
+      int ret = io_uring_wait_cqe(&wal->ring, &cqe);
+      if (ret < 0) return KANBUDB_ERR_IO;
+      int err = cqe->res;
+      uint64_t ud = cqe->user_data;
       io_uring_cqe_seen(&wal->ring, cqe);
+      if (ud == 3) {
+        if (err < 0) return KANBUDB_ERR_IO;
+        return KANBUDB_OK;
+      }
     }
-    return KANBUDB_OK;
   }
 #endif
 
@@ -423,7 +430,7 @@ int wal_truncate(kanbudb_wal_t* wal)
   wal->fd = open(wal->path, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (wal->fd < 0) return KANBUDB_ERR_IO;
 
-  wal->file = fopen(wal->path, "wb");
+  wal->file = fopen(wal->path, "w+b");
   if (!wal->file) { close(wal->fd); wal->fd = -1; return KANBUDB_ERR_IO; }
 
   /* Write fresh header with current seq */
