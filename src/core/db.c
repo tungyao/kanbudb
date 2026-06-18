@@ -29,7 +29,9 @@ static const db_config_t default_config = {
   KANBUDB_FSYNC_NONE,
   65536,
   65536,
-  1
+  1,
+  0,    /* multi_process */
+  10    /* reader_poll_ms */
 };
 
 struct sstable_flush_ctx {

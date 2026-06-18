@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include "fts/index.h"
 #include "vector.h"
+#include "wal_mmap.h"
+#include "shared_meta.h"
 
 #define KANBUDB_MAX_TABLES 64
 
@@ -48,6 +50,12 @@ struct kanbudb_db {
   pthread_t            compact_thread;
   int                  compact_running;
   int                  compact_trigger;
+  /* Multi-process sharing */
+  int                  is_reader;
+  kanbudb_wal_mmap_t   wal_mmap;
+  kanbudb_shared_meta_t shared_meta;
+  pthread_t            reader_poll_thread;
+  int                  reader_poll_running;
 };
 
 #endif /* KANBUDB_CORE_DB_H */

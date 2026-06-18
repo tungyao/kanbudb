@@ -40,6 +40,8 @@ typedef struct db_config_t {
   size_t cache_size;
   size_t memtable_size;
   int compaction_threads;
+  int multi_process;        /* 1 = enable multi-process sharing */
+  int reader_poll_ms;       /* reader polling interval in ms (default 10) */
 } db_config_t;
 
 /* FTS options */
@@ -52,6 +54,12 @@ typedef struct {
 /* Database lifecycle */
 int db_open(const char *path, const db_config_t *config, db_t **out);
 int db_close(db_t *db);
+
+/* Multi-process: open as read-only reader */
+int db_open_reader(const char *path, const db_config_t *config, db_t **out);
+
+/* Multi-process: manually trigger reader refresh from WAL */
+int db_reader_refresh(db_t *db);
 int db_last_error(db_t *db);
 const char *db_error_string(int err);
 
