@@ -294,6 +294,150 @@ static void* compact_worker(void* arg) {
   return NULL;
 }
 
+/* ── Reader refresh: apply mmap'd WAL entries to local B-tree ── */
+
+int db_reader_refresh(db_t* db) {
+  if (!db) return KANBUDB_ERR_INVAL;
+  struct kanbudb_db* internal = (struct kanbudb_db*)db;
+
+  /* If WAL not opened yet, try to open it */
+  if (!internal->wal_mmap.region.addr) {
+    char wal_path_mmap[512];
+    snprintf(wal_path_mmap, sizeof(wal_path_mmap), "%s.wal.mmap", internal->path);
+    size_t wal_data_cap = 64 * 1024 * 1024;  /* 64MB */
+    int mrc = wal_mmap_open(wal_path_mmap, 0, wal_data_cap, &internal->wal_mmap);
+    if (mrc < 0) return KANBUDB_ERR_IO;
+  }
+
+  /* Re-read schema from system SSTable if not loaded yet */
+  if (internal->num_tables == 0) {
+    char sys_path[512];
+    snprintf(sys_path, sizeof(sys_path), "%s%s", internal->path, KANBUDB_SYSTEM_TABLE_SUFFIX);
+    sstable_reader_t* sr = sstable_reader_open(sys_path);
+    if (sr) {
+      schema_load_ctx_t lc;
+      memset(&lc, 0, sizeof(lc));
+      lc.db = internal;
+      sstable_reader_scan(sr, &schema_load_cb, &lc);
+      sstable_reader_close(sr);
+    }
+  }
+
+  /* Read all available entries and apply to local B-tree */
+  pthread_rwlock_wrlock(&internal->btree_lock);
+  for (;;) {
+    uint64_t seq;
+    int op;
+    uint64_t table_id;
+    void* key; size_t key_len;
+    void* value; size_t val_len;
+
+    int rc = wal_mmap_read_entry(&internal->wal_mmap, &seq, &op, &table_id,
+                                  &key, &key_len, &value, &val_len);
+    if (rc != KANBUDB_OK) break;  /* no more entries or error */
+
+    if (op == KANBUDB_WAL_PUT) {
+      btree_put(internal->btree, key, key_len, value, val_len);
+    } else {
+      btree_delete(internal->btree, key, key_len);
+    }
+  }
+  pthread_rwlock_unlock(&internal->btree_lock);
+  return KANBUDB_OK;
+}
+
+static void* reader_poll_worker(void* arg) {
+  struct kanbudb_db* db = (struct kanbudb_db*)arg;
+  int poll_ms = db->config.reader_poll_ms;
+  if (poll_ms <= 0) poll_ms = 10;
+
+  while (db->reader_poll_running) {
+    usleep((useconds_t)poll_ms * 1000);
+    if (!db->reader_poll_running) break;
+    db_reader_refresh((db_t*)db);
+  }
+  return NULL;
+}
+
+/* ── db_open_reader ──────────────────────────────────────── */
+
+int db_open_reader(const char* path, const db_config_t* config, db_t** out) {
+  if (!path || !out) return KANBUDB_ERR_INVAL;
+
+  struct kanbudb_db* db = (struct kanbudb_db*)calloc(1, sizeof(*db));
+  if (!db) return KANBUDB_ERR_OOM;
+
+  db->path = strdup(path);
+  if (!db->path) { free(db); return KANBUDB_ERR_OOM; }
+
+  db->config = config ? *config : default_config;
+  db->is_reader = 1;
+
+  db->btree = btree_create();
+  if (!db->btree) { free(db->path); free(db); return KANBUDB_ERR_OOM; }
+
+  pthread_rwlock_init(&db->table_lock, NULL);
+  pthread_rwlock_init(&db->lsm_lock, NULL);
+  pthread_rwlock_init(&db->btree_lock, NULL);
+
+  db->num_tables = 0;
+  db->last_error = KANBUDB_OK;
+
+  /* Load schema from .system SSTable */
+  {
+    char sys_path[512];
+    snprintf(sys_path, sizeof(sys_path), "%s%s", path, KANBUDB_SYSTEM_TABLE_SUFFIX);
+    sstable_reader_t* sr = sstable_reader_open(sys_path);
+    if (sr) {
+      schema_load_ctx_t lc;
+      memset(&lc, 0, sizeof(lc));
+      lc.db = db;
+      sstable_reader_scan(sr, &schema_load_cb, &lc);
+      sstable_reader_close(sr);
+    }
+  }
+
+  /* Load data SSTables into B-tree (leveled order) */
+  {
+    kanbudb_level_t levels[KANBUDB_MAX_LEVELS];
+    compaction_scan_levels(path, levels, KANBUDB_MAX_LEVELS);
+    for (int lvl = 0; lvl < KANBUDB_MAX_LEVELS; lvl++) {
+      for (int i = 0; i < levels[lvl].num_files; i++) {
+        sstable_reader_t* sr = sstable_reader_open(levels[lvl].file_paths[i]);
+        if (sr) {
+          sstable_reader_scan(sr, &sstable_load_cb, db);
+          sstable_reader_close(sr);
+        }
+      }
+    }
+    compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
+  }
+
+  /* Join shared metadata, increment reader_count */
+  kanbudb_shared_meta_reader_join(path, &db->shared_meta);
+
+  /* Open WAL with mmap (read-only) */
+  {
+    char wal_path_mmap[512];
+    snprintf(wal_path_mmap, sizeof(wal_path_mmap), "%s.wal.mmap", path);
+    size_t wal_data_cap = 64 * 1024 * 1024;  /* 64MB */
+    int mrc = wal_mmap_open(wal_path_mmap, 0, wal_data_cap, &db->wal_mmap);
+    if (mrc < 0) {
+      /* Non-fatal: reader can still read SSTables */
+    }
+  }
+
+  /* Start poll thread */
+  db->reader_poll_running = 1;
+  pthread_create(&db->reader_poll_thread, NULL, reader_poll_worker, db);
+
+  /* Do initial refresh */
+  db_reader_refresh((db_t*)db);
+
+  *out = db;
+  return KANBUDB_OK;
+}
+
 /* ── SSTable path comparison (sort by seq number) ─────────── */
 
 static int sst_path_cmp(const void* a, const void* b) {
@@ -469,6 +613,18 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
     wal_replay(db->wal, &wal_replay_cb, db);
   }
 
+  /* Phase 5: multi-process WAL mmap initialization */
+  if (db->config.multi_process) {
+    kanbudb_shared_meta_open(path, &db->shared_meta);
+    char wal_path_mmap[512];
+    snprintf(wal_path_mmap, sizeof(wal_path_mmap), "%s.wal.mmap", path);
+    size_t wal_data_cap = 64 * 1024 * 1024;  /* 64MB */
+    int mrc = wal_mmap_open(wal_path_mmap, 1, wal_data_cap, &db->wal_mmap);
+    if (mrc < 0) {
+      db->config.multi_process = 0;
+    }
+  }
+
   *out = db;
   return KANBUDB_OK;
 }
@@ -478,6 +634,28 @@ int db_open(const char* path, const db_config_t* config, db_t** out) {
 int db_close(db_t* db) {
   if (!db) return KANBUDB_ERR_INVAL;
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
+
+  /* Reader cleanup: skip writer-specific teardown */
+  if (internal->is_reader) {
+    internal->reader_poll_running = 0;
+    pthread_join(internal->reader_poll_thread, NULL);
+    kanbudb_shared_meta_reader_leave(internal->path, &internal->shared_meta);
+    wal_mmap_close(&internal->wal_mmap);
+    pthread_rwlock_destroy(&internal->table_lock);
+    pthread_rwlock_destroy(&internal->lsm_lock);
+    pthread_rwlock_destroy(&internal->btree_lock);
+    btree_destroy(internal->btree);
+    for (int i = 0; i < internal->num_tables; i++) {
+      for (int j = 0; j < internal->tables[i].num_cols; j++) {
+        free(internal->tables[i].col_names[j]);
+      }
+      free(internal->tables[i].col_types);
+      free(internal->tables[i].col_names);
+    }
+    free(internal->path);
+    free(internal);
+    return KANBUDB_OK;
+  }
 
   /* Acquire all locks in order */
   pthread_rwlock_wrlock(&internal->table_lock);
@@ -522,6 +700,9 @@ int db_close(db_t* db) {
   btree_destroy(internal->btree);
   lsm_destroy(internal->lsm);
   wal_destroy(internal->wal);
+  if (internal->wal_mmap.region.addr) {
+    wal_mmap_close(&internal->wal_mmap);
+  }
   free(internal->path);
 
   pthread_rwlock_unlock(&internal->table_lock);
@@ -648,6 +829,14 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
     return rc;
   }
 
+  /* In multi_process mode, also append to mmap'd WAL for readers */
+  if (internal->config.multi_process && internal->wal_mmap.region.addr) {
+    wal_mmap_append(&internal->wal_mmap, wal_last_seq(internal->wal),
+                    0 /* PUT */, tbl_id,
+                    key, key_len, value, value_len);
+    wal_mmap_sync(&internal->wal_mmap);
+  }
+
   pthread_rwlock_wrlock(&internal->lsm_lock);
   rc = lsm_put(internal->lsm, tbl_id,
                 key, key_len, value, value_len);
@@ -692,17 +881,19 @@ int db_get(db_t* db, const char* table, const char* key, size_t key_len,
   uint64_t tbl_id = internal->tables[idx].id;
   pthread_rwlock_unlock(&internal->table_lock);
 
-  pthread_rwlock_rdlock(&internal->lsm_lock);
-  int rc = lsm_get(internal->lsm, tbl_id,
-                    key, key_len, value, value_len);
-  pthread_rwlock_unlock(&internal->lsm_lock);
-  if (rc == KANBUDB_OK) {
-    internal->last_error = KANBUDB_OK;
-    return KANBUDB_OK;
+  if (internal->lsm) {
+    pthread_rwlock_rdlock(&internal->lsm_lock);
+    int lsm_rc = lsm_get(internal->lsm, tbl_id,
+                      key, key_len, value, value_len);
+    pthread_rwlock_unlock(&internal->lsm_lock);
+    if (lsm_rc == KANBUDB_OK) {
+      internal->last_error = KANBUDB_OK;
+      return KANBUDB_OK;
+    }
   }
 
   pthread_rwlock_rdlock(&internal->btree_lock);
-  rc = btree_get(internal->btree, key, key_len, value, value_len);
+  int rc = btree_get(internal->btree, key, key_len, value, value_len);
   pthread_rwlock_unlock(&internal->btree_lock);
   if (rc == KANBUDB_OK) {
     internal->last_error = KANBUDB_OK;

@@ -187,6 +187,11 @@ if(KANBUDB_BUILD_TESTS)
   target_link_libraries(test_wal_mmap kanbudb_static)
   add_test(NAME test_wal_mmap COMMAND test_wal_mmap)
 
+  add_executable(test_multiprocess test/unit/test_multiprocess.c)
+  target_include_directories(test_multiprocess PRIVATE src/util src/storage src)
+  target_link_libraries(test_multiprocess kanbudb_static Threads::Threads)
+  add_test(NAME test_multiprocess COMMAND test_multiprocess)
+
   add_executable(bench_vector test/bench/bench_vector.c)
   target_include_directories(bench_vector PRIVATE src/vector)
   target_link_libraries(bench_vector kanbudb_static m)
