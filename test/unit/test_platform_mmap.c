@@ -7,12 +7,13 @@
 #include <fcntl.h>
 
 static void test_mmap_open_close(void) {
-  const char* path = "/tmp/test_mmap_basic.dat";
-  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-  assert(fd >= 0);
+  char path[] = "/tmp/test_mmap_basic_XXXXXX";
+  int tmpfd = mkstemp(path);
+  assert(tmpfd >= 0);
   uint64_t val = 42;
-  write(fd, &val, sizeof(val));
-  close(fd);
+  ssize_t wr = write(tmpfd, &val, sizeof(val));
+  assert(wr == sizeof(val));
+  close(tmpfd);
 
   kanbudb_mmap_region_t region;
   int rc = kanbudb_mmap_open(path, KANBUDB_MMAP_READ, 0, &region);
@@ -30,12 +31,13 @@ static void test_mmap_open_close(void) {
 }
 
 static void test_mmap_read_write(void) {
-  const char* path = "/tmp/test_mmap_rw.dat";
-  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-  assert(fd >= 0);
+  char path[] = "/tmp/test_mmap_rw_XXXXXX";
+  int tmpfd = mkstemp(path);
+  assert(tmpfd >= 0);
   uint64_t zeros[4] = {0};
-  write(fd, zeros, sizeof(zeros));
-  close(fd);
+  ssize_t wr = write(tmpfd, zeros, sizeof(zeros));
+  assert(wr == sizeof(zeros));
+  close(tmpfd);
 
   kanbudb_mmap_region_t region;
   int rc = kanbudb_mmap_open(path, KANBUDB_MMAP_WRITE, sizeof(zeros), &region);

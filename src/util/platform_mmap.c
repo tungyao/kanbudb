@@ -15,6 +15,9 @@
 int kanbudb_mmap_open(const char* path, int rw, size_t size,
                       kanbudb_mmap_region_t* region) {
   if (!region) { errno = EINVAL; return -1; }
+  if (rw != KANBUDB_MMAP_READ && rw != KANBUDB_MMAP_WRITE) {
+    errno = EINVAL; return -1;
+  }
   memset(region, 0, sizeof(*region));
   region->handle = KANBUDB_MMAP_INVALID;
   region->addr   = KANBUDB_MMAP_INVALID;
@@ -33,6 +36,7 @@ int kanbudb_mmap_open(const char* path, int rw, size_t size,
   if (size == 0) {
     LARGE_INTEGER li;
     if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); return -1; }
+    if (li.QuadPart < 0) { CloseHandle(hFile); errno = EINVAL; return -1; }
     size = (size_t)li.QuadPart;
   }
   if (size == 0) { CloseHandle(hFile); errno = EINVAL; return -1; }
@@ -41,7 +45,8 @@ int kanbudb_mmap_open(const char* path, int rw, size_t size,
                 ? PAGE_READWRITE : PAGE_READONLY;
   DWORD mapAccess = (rw == KANBUDB_MMAP_WRITE)
                     ? FILE_MAP_WRITE : FILE_MAP_READ;
-  HANDLE hMap = CreateFileMappingA(hFile, NULL, prot, 0, 0, NULL);
+  HANDLE hMap = CreateFileMappingA(hFile, NULL, prot,
+                                  (DWORD)(size >> 32), (DWORD)(size & 0xFFFFFFFF), NULL);
   if (!hMap) { CloseHandle(hFile); return -1; }
 
   void* addr = MapViewOfFile(hMap, mapAccess, 0, 0, 0);
