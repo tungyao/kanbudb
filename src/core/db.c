@@ -835,6 +835,17 @@ int db_put(db_t* db, const char* table, const char* key, size_t key_len,
                     0 /* PUT */, tbl_id,
                     key, key_len, value, value_len);
     wal_mmap_sync(&internal->wal_mmap);
+
+    /* Check if WAL is getting full and needs a switch */
+    uint64_t write_pos = wal_mmap_get_write_pos(&internal->wal_mmap);
+    size_t data_used = (size_t)(write_pos - KANBUDB_WAL_MMAP_HEADER_SIZE);
+    size_t data_cap = internal->wal_mmap.data_cap;
+
+    if (data_cap > 0 && data_used > data_cap * 80 / 100) {
+      char wal_path_switch[512];
+      snprintf(wal_path_switch, sizeof(wal_path_switch), "%s.wal.mmap", internal->path);
+      wal_mmap_switch_file(wal_path_switch, &internal->wal_mmap);
+    }
   }
 
   pthread_rwlock_wrlock(&internal->lsm_lock);

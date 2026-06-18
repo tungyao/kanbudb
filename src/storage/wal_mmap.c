@@ -148,3 +148,22 @@ int wal_mmap_sync(kanbudb_wal_mmap_t* wm) {
 int wal_mmap_close(kanbudb_wal_mmap_t* wm) {
   return kanbudb_mmap_close(&wm->region);
 }
+
+int wal_mmap_switch_file(const char* wal_path, kanbudb_wal_mmap_t* wm) {
+  char new_path[512];
+  snprintf(new_path, sizeof(new_path), "%s.new", wal_path);
+
+  kanbudb_wal_mmap_t new_wm;
+  size_t data_cap = wm->data_cap > 0 ? wm->data_cap : 64 * 1024 * 1024;
+  int rc = wal_mmap_open(new_path, 1, data_cap, &new_wm);
+  if (rc < 0) return -1;
+
+  wal_mmap_sync(&new_wm);
+  wal_mmap_close(&new_wm);
+
+  kanbudb_mmap_close(&wm->region);
+
+  if (rename(new_path, wal_path) < 0) return -1;
+
+  return wal_mmap_open(wal_path, 1, data_cap, wm);
+}

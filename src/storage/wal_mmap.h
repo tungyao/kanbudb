@@ -44,4 +44,9 @@ int wal_mmap_sync(kanbudb_wal_mmap_t* wm);
 
 int wal_mmap_close(kanbudb_wal_mmap_t* wm);
 
+/* Switch to a new WAL file. Creates a fresh WAL, copies unflushed entries,
+   atomic renames to wal_path, reopens.
+   Returns 0 on success. */
+int wal_mmap_switch_file(const char* wal_path, kanbudb_wal_mmap_t* wm);
+
 #endif
