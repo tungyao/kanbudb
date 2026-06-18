@@ -13,6 +13,7 @@ set(KANBUDB_SOURCES
   src/util/fst.c
   src/util/bloom.c
   src/storage/wal.c
+  src/storage/shared_meta.c
   src/storage/lsm.c
   src/storage/btree.c
   src/storage/compaction.c
@@ -174,6 +175,11 @@ if(KANBUDB_BUILD_TESTS)
   target_include_directories(test_platform_mmap PRIVATE src/util)
   target_link_libraries(test_platform_mmap kanbudb_static)
   add_test(NAME test_platform_mmap COMMAND test_platform_mmap)
+
+  add_executable(test_shared_meta test/unit/test_shared_meta.c)
+  target_include_directories(test_shared_meta PRIVATE src/storage src/util)
+  target_link_libraries(test_shared_meta kanbudb_static)
+  add_test(NAME test_shared_meta COMMAND test_shared_meta)
 
   add_executable(bench_vector test/bench/bench_vector.c)
   target_include_directories(bench_vector PRIVATE src/vector)
