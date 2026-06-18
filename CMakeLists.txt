@@ -9,6 +9,7 @@ option(KANBUDB_BUILD_TESTS "Build tests" ON)
 set(KANBUDB_SOURCES
   src/util/arena.c
   src/util/page_cache.c
+  src/util/platform_mmap.c
   src/util/fst.c
   src/util/bloom.c
   src/storage/wal.c
@@ -168,6 +169,11 @@ if(KANBUDB_BUILD_TESTS)
   target_include_directories(test_vec_filter PRIVATE src/vector)
   target_link_libraries(test_vec_filter kanbudb_static m)
   add_test(NAME test_vec_filter COMMAND test_vec_filter)
+
+  add_executable(test_platform_mmap test/unit/test_platform_mmap.c)
+  target_include_directories(test_platform_mmap PRIVATE src/util)
+  target_link_libraries(test_platform_mmap kanbudb_static)
+  add_test(NAME test_platform_mmap COMMAND test_platform_mmap)
 
   add_executable(bench_vector test/bench/bench_vector.c)
   target_include_directories(bench_vector PRIVATE src/vector)
