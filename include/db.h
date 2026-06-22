@@ -42,6 +42,10 @@ typedef struct db_config_t {
   int compaction_threads;
   int multi_process;        /* 1 = enable multi-process sharing */
   int reader_poll_ms;       /* reader polling interval in ms (default 10) */
+  /* Leveled compaction config (0 = use defaults) */
+  int level0_file_num_compaction_trigger;  /* default 4 */
+  uint64_t max_bytes_for_level_base;       /* default 10MB */
+  double max_bytes_for_level_multiplier;   /* default 10 */
 } db_config_t;
 
 /* FTS options */

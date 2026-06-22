@@ -273,6 +273,15 @@ int compaction_merge_to_level(const char** input_paths, int num_inputs,
             memcmp(entries[i].key, prev_key, entries[i].key_len) == 0) {
             continue;
         }
+        /* Tombstone GC: skip tombstones at merge output.
+         * The surviving entry (highest seq) for a key is a tombstone
+         * means the key was deleted — no need to preserve it. */
+        if (entries[i].flag & KANBUDB_SSTABLE_FLAG_TOMBSTONE) {
+            prev_key = entries[i].key;
+            prev_key_len = entries[i].key_len;
+            first = 0;
+            continue;
+        }
         rc = sstable_writer_add(w, entries[i].key, entries[i].key_len,
                                 entries[i].value, entries[i].val_len,
                                 entries[i].flag);
@@ -292,6 +301,61 @@ int compaction_merge_to_level(const char** input_paths, int num_inputs,
         free(entries[j].value);
     }
     free(entries);
+    return rc;
+}
+
+/* ── compaction_register_file ──────────────────────────── */
+
+void compaction_register_file(compaction_manager_t* mgr, int level,
+                              const char* path, uint64_t file_size)
+{
+    if (!mgr || level < 0 || level >= KANBUDB_MAX_LEVELS) return;
+    compaction_level_t* lv = &mgr->levels[level];
+    char** new_paths = (char**)realloc(lv->file_paths,
+                          (size_t)(lv->num_files + 1) * sizeof(char*));
+    if (!new_paths) return;
+    new_paths[lv->num_files] = strdup(path);
+    if (!new_paths[lv->num_files]) return;
+    lv->file_paths = new_paths;
+    lv->num_files++;
+    lv->total_size += file_size;
+}
+
+/* ── compaction_run_level ──────────────────────────────── */
+
+int compaction_run_level(const char* db_path, int level,
+                         uint64_t output_sequence)
+{
+    if (!db_path || level < 0 || level >= KANBUDB_MAX_LEVELS - 1)
+        return KANBUDB_ERR_INVAL;
+
+    compaction_level_t levels[KANBUDB_MAX_LEVELS];
+    int rc = compaction_scan_levels(db_path, levels, KANBUDB_MAX_LEVELS);
+    if (rc != KANBUDB_OK) return rc;
+
+    int src_level = compaction_pick_level(levels, KANBUDB_MAX_LEVELS);
+    if (src_level < 0 || levels[src_level].num_files == 0) {
+        compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
+        return KANBUDB_OK; /* nothing to compact */
+    }
+
+    int dst_level = src_level + 1;
+    char out_path[512];
+    compaction_make_path(db_path, dst_level, output_sequence,
+                         out_path, sizeof(out_path));
+
+    rc = compaction_merge_to_level(
+        (const char**)levels[src_level].file_paths,
+        levels[src_level].num_files,
+        out_path, output_sequence);
+
+    if (rc == KANBUDB_OK) {
+        for (int i = 0; i < levels[src_level].num_files; i++) {
+            unlink(levels[src_level].file_paths[i]);
+        }
+    }
+
+    compaction_free_levels(levels, KANBUDB_MAX_LEVELS);
     return rc;
 }
 

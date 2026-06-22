@@ -31,7 +31,10 @@ static const db_config_t default_config = {
   65536,
   1,
   0,    /* multi_process */
-  10    /* reader_poll_ms */
+  10,   /* reader_poll_ms */
+  4,    /* level0_file_num_compaction_trigger */
+  10ULL * 1024 * 1024,  /* max_bytes_for_level_base (10MB) */
+  10.0  /* max_bytes_for_level_multiplier */
 };
 
 struct sstable_flush_ctx {
@@ -301,12 +304,16 @@ int db_reader_refresh(db_t* db) {
   struct kanbudb_db* internal = (struct kanbudb_db*)db;
 
   /* If WAL not opened yet, try to open it */
-  if (!internal->wal_mmap.region.addr) {
+  if (!internal->wal_mmap.region.addr ||
+      internal->wal_mmap.region.addr == (void*)-1) {
     char wal_path_mmap[512];
     snprintf(wal_path_mmap, sizeof(wal_path_mmap), "%s.wal.mmap", internal->path);
     size_t wal_data_cap = 64 * 1024 * 1024;  /* 64MB */
     int mrc = wal_mmap_open(wal_path_mmap, 0, wal_data_cap, &internal->wal_mmap);
-    if (mrc < 0) return KANBUDB_ERR_IO;
+    if (mrc < 0) {
+      internal->wal_mmap.region.addr = NULL;
+      return KANBUDB_ERR_IO;
+    }
   }
 
   /* Re-read schema from system SSTable if not loaded yet */
@@ -325,21 +332,23 @@ int db_reader_refresh(db_t* db) {
 
   /* Read all available entries and apply to local B-tree */
   pthread_rwlock_wrlock(&internal->btree_lock);
-  for (;;) {
-    uint64_t seq;
-    int op;
-    uint64_t table_id;
-    void* key; size_t key_len;
-    void* value; size_t val_len;
+  if (internal->wal_mmap.region.addr && internal->wal_mmap.header) {
+    for (;;) {
+      uint64_t seq;
+      int op;
+      uint64_t table_id;
+      void* key; size_t key_len;
+      void* value; size_t val_len;
 
-    int rc = wal_mmap_read_entry(&internal->wal_mmap, &seq, &op, &table_id,
-                                  &key, &key_len, &value, &val_len);
-    if (rc != KANBUDB_OK) break;  /* no more entries or error */
+      int rc = wal_mmap_read_entry(&internal->wal_mmap, &seq, &op, &table_id,
+                                    &key, &key_len, &value, &val_len);
+      if (rc != KANBUDB_OK) break;
 
-    if (op == KANBUDB_WAL_PUT) {
-      btree_put(internal->btree, key, key_len, value, val_len);
-    } else {
-      btree_delete(internal->btree, key, key_len);
+      if (op == KANBUDB_WAL_PUT) {
+        btree_put(internal->btree, key, key_len, value, val_len);
+      } else {
+        btree_delete(internal->btree, key, key_len);
+      }
     }
   }
   pthread_rwlock_unlock(&internal->btree_lock);

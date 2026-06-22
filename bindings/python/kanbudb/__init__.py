@@ -15,7 +15,7 @@ Usage:
 import ctypes
 import os
 import struct
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 # ── Load shared library ──────────────────────────────────────────────
 
@@ -34,6 +34,10 @@ if not _lib_path:
 
 _lib = ctypes.cdll.LoadLibrary(_lib_path)
 
+# ── Callback type for filtered vector search ────────────────────────
+
+_VEC_FILTER_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p)
+
 # ── C types ──────────────────────────────────────────────────────────
 
 class _DbConfig(ctypes.Structure):
@@ -42,6 +46,11 @@ class _DbConfig(ctypes.Structure):
         ("cache_size", ctypes.c_size_t),
         ("memtable_size", ctypes.c_size_t),
         ("compaction_threads", ctypes.c_int),
+        ("multi_process", ctypes.c_int),
+        ("reader_poll_ms", ctypes.c_int),
+        ("level0_file_num_compaction_trigger", ctypes.c_int),
+        ("max_bytes_for_level_base", ctypes.c_uint64),
+        ("max_bytes_for_level_multiplier", ctypes.c_double),
     ]
 
 class _FtsOptions(ctypes.Structure):
@@ -69,12 +78,50 @@ class _VecResult(ctypes.Structure):
         ("distance", ctypes.c_float),
     ]
 
+class _VecStats(ctypes.Structure):
+    _fields_ = [
+        ("count", ctypes.c_uint64),
+        ("capacity", ctypes.c_uint64),
+        ("memory_bytes", ctypes.c_uint64),
+        ("dimension", ctypes.c_uint32),
+    ]
+
+class _HybridParams(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_int),
+        ("vec_weight", ctypes.c_double),
+        ("fts_weight", ctypes.c_double),
+        ("k", ctypes.c_uint32),
+    ]
+
+class _HybridResult(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("score", ctypes.c_double),
+        ("vec_distance", ctypes.c_double),
+        ("fts_score", ctypes.c_double),
+    ]
+
+class _QuantParams(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("dimension", ctypes.c_uint32),
+        ("pq_subspaces", ctypes.c_uint32),
+    ]
+
 VEC_ALGO_FLAT = 0
 VEC_ALGO_HNSW = 1
 
 VEC_METRIC_L2 = 0
 VEC_METRIC_COSINE = 1
 VEC_METRIC_IP = 2
+
+HYBRID_MODE_RRF = 0
+HYBRID_MODE_WEIGHTED = 1
+
+QUANT_NONE = 0
+QUANT_SQ8 = 1
+QUANT_PQ = 2
 
 # ── Error codes ──────────────────────────────────────────────────────
 
@@ -103,8 +150,12 @@ _FSYNC_ALWAYS = 2
 
 # ── C function signatures ────────────────────────────────────────────
 
+# Lifecycle
 _lib.db_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(_DbConfig), ctypes.POINTER(ctypes.c_void_p)]
 _lib.db_open.restype = ctypes.c_int
+
+_lib.db_open_reader.argtypes = [ctypes.c_char_p, ctypes.POINTER(_DbConfig), ctypes.POINTER(ctypes.c_void_p)]
+_lib.db_open_reader.restype = ctypes.c_int
 
 _lib.db_close.argtypes = [ctypes.c_void_p]
 _lib.db_close.restype = ctypes.c_int
@@ -115,6 +166,10 @@ _lib.db_last_error.restype = ctypes.c_int
 _lib.db_error_string.argtypes = [ctypes.c_int]
 _lib.db_error_string.restype = ctypes.c_char_p
 
+_lib.db_reader_refresh.argtypes = [ctypes.c_void_p]
+_lib.db_reader_refresh.restype = ctypes.c_int
+
+# Schema
 _lib.db_create_table.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p,
     ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int),
@@ -122,6 +177,7 @@ _lib.db_create_table.argtypes = [
 ]
 _lib.db_create_table.restype = ctypes.c_int
 
+# CRUD
 _lib.db_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
 _lib.db_put.restype = ctypes.c_int
 
@@ -131,8 +187,12 @@ _lib.db_get.restype = ctypes.c_int
 _lib.db_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
 _lib.db_delete.restype = ctypes.c_int
 
+# Query builder
 _lib.db_query.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 _lib.db_query.restype = ctypes.c_void_p
+
+_lib.qb_from.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+_lib.qb_from.restype = ctypes.c_int
 
 _lib.qb_filter.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qb_filter.restype = ctypes.c_int
@@ -167,6 +227,7 @@ _lib.rs_num_columns.restype = ctypes.c_int
 _lib.rs_close.argtypes = [ctypes.c_void_p]
 _lib.rs_close.restype = None
 
+# FTS
 _lib.db_fts_create_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(_FtsOptions)]
 _lib.db_fts_create_index.restype = ctypes.c_int
 
@@ -176,6 +237,7 @@ _lib.db_fts_search.restype = ctypes.c_int
 _lib.db_fts_drop_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
 _lib.db_fts_drop_index.restype = ctypes.c_int
 
+# Conditions
 _lib.qb_cond.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
 _lib.qb_cond.restype = ctypes.c_void_p
 
@@ -191,7 +253,7 @@ _lib.qb_cond_not.restype = ctypes.c_void_p
 _lib.qb_where.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _lib.qb_where.restype = ctypes.c_int
 
-# ── Vector function signatures ───────────────────────────────────────
+# ── Standalone vector index (vector.h) ───────────────────────────────
 
 _lib.kanbudb_vec_create.argtypes = [
     ctypes.c_char_p, ctypes.POINTER(_VecParams), ctypes.POINTER(ctypes.c_void_p),
@@ -204,11 +266,29 @@ _lib.kanbudb_vec_open.restype = ctypes.c_int
 _lib.kanbudb_vec_close.argtypes = [ctypes.c_void_p]
 _lib.kanbudb_vec_close.restype = ctypes.c_int
 
+_lib.kanbudb_vec_flush.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_vec_flush.restype = ctypes.c_int
+
+_lib.kanbudb_vec_flush_interval.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_lib.kanbudb_vec_flush_interval.restype = ctypes.c_int
+
+_lib.kanbudb_vec_destroy.argtypes = [ctypes.c_char_p]
+_lib.kanbudb_vec_destroy.restype = ctypes.c_int
+
 _lib.kanbudb_vec_insert.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
 _lib.kanbudb_vec_insert.restype = ctypes.c_int
 
+_lib.kanbudb_vec_insert_batch.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_float),
+]
+_lib.kanbudb_vec_insert_batch.restype = ctypes.c_int
+
 _lib.kanbudb_vec_delete.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 _lib.kanbudb_vec_delete.restype = ctypes.c_int
+
+_lib.kanbudb_vec_get.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+_lib.kanbudb_vec_get.restype = ctypes.c_int
 
 _lib.kanbudb_vec_search.argtypes = [
     ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
@@ -216,13 +296,44 @@ _lib.kanbudb_vec_search.argtypes = [
 ]
 _lib.kanbudb_vec_search.restype = ctypes.c_int
 
+_lib.kanbudb_vec_search_radius.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_float,
+    ctypes.POINTER(_VecResult), ctypes.c_uint32,
+]
+_lib.kanbudb_vec_search_radius.restype = ctypes.c_int
+
 _lib.kanbudb_vec_count.argtypes = [ctypes.c_void_p]
 _lib.kanbudb_vec_count.restype = ctypes.c_int
 
 _lib.kanbudb_vec_dimension.argtypes = [ctypes.c_void_p]
 _lib.kanbudb_vec_dimension.restype = ctypes.c_int
 
-# ── DB-level vector + embedding function signatures ──────────────────
+_lib.kanbudb_vec_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(_VecStats)]
+_lib.kanbudb_vec_stats.restype = ctypes.c_int
+
+# ── Standalone embedding (vector.h) ──────────────────────────────────
+
+_lib.kanbudb_embed_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+_lib.kanbudb_embed_create.restype = ctypes.c_int
+
+_lib.kanbudb_embed_destroy.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_embed_destroy.restype = None
+
+_lib.kanbudb_embed_text.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_float),
+]
+_lib.kanbudb_embed_text.restype = ctypes.c_int
+
+_lib.kanbudb_embed_batch.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t),
+    ctypes.c_uint32, ctypes.POINTER(ctypes.c_float),
+]
+_lib.kanbudb_embed_batch.restype = ctypes.c_int
+
+_lib.kanbudb_embed_dimensions.argtypes = [ctypes.c_void_p]
+_lib.kanbudb_embed_dimensions.restype = ctypes.c_uint32
+
+# ── DB-level vector + embedding (db.h) ───────────────────────────────
 
 class _DbVecOptions(ctypes.Structure):
     _fields_ = [
@@ -242,6 +353,16 @@ _lib.db_vec_destroy_index.restype = ctypes.c_int
 _lib.db_vec_insert_text.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t]
 _lib.db_vec_insert_text.restype = ctypes.c_int
 
+_lib.db_vec_insert_batch.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_char_p),
+    ctypes.POINTER(ctypes.c_size_t),
+]
+_lib.db_vec_insert_batch.restype = ctypes.c_int
+
+_lib.db_vec_insert_vector.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+_lib.db_vec_insert_vector.restype = ctypes.c_int
+
 _lib.db_vec_search_text.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
     ctypes.c_uint32, ctypes.POINTER(_VecResult),
@@ -257,27 +378,60 @@ _lib.db_vec_search.restype = ctypes.c_int
 _lib.db_vec_delete.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 _lib.db_vec_delete.restype = ctypes.c_int
 
-_lib.db_vec_insert_vector.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
-_lib.db_vec_insert_vector.restype = ctypes.c_int
-
 _lib.db_vec_count.argtypes = [ctypes.c_void_p]
 _lib.db_vec_count.restype = ctypes.c_int
 
-# ── Standalone embedding function signatures ─────────────────────────
+_lib.db_vec_flush.argtypes = [ctypes.c_void_p]
+_lib.db_vec_flush.restype = ctypes.c_int
 
-_lib.kanbudb_embed_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
-_lib.kanbudb_embed_create.restype = ctypes.c_int
+_lib.db_vec_set_embed.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_lib.db_vec_set_embed.restype = ctypes.c_int
 
-_lib.kanbudb_embed_destroy.argtypes = [ctypes.c_void_p]
-_lib.kanbudb_embed_destroy.restype = None
+# ── Filtered vector search (db.h) ────────────────────────────────────
 
-_lib.kanbudb_embed_text.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_float),
+_lib.db_vec_search_filtered.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    _VEC_FILTER_CB, ctypes.c_void_p, ctypes.POINTER(_VecResult),
 ]
-_lib.kanbudb_embed_text.restype = ctypes.c_int
+_lib.db_vec_search_filtered.restype = ctypes.c_int
 
-_lib.kanbudb_embed_dimensions.argtypes = [ctypes.c_void_p]
-_lib.kanbudb_embed_dimensions.restype = ctypes.c_uint32
+_lib.db_vec_search_text_filtered.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32,
+    _VEC_FILTER_CB, ctypes.c_void_p, ctypes.POINTER(_VecResult),
+]
+_lib.db_vec_search_text_filtered.restype = ctypes.c_int
+
+# ── Hybrid search (db.h) ─────────────────────────────────────────────
+
+_lib.db_hybrid_search.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ctypes.c_char_p, ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(_HybridParams), ctypes.POINTER(_HybridResult), ctypes.c_int,
+]
+_lib.db_hybrid_search.restype = ctypes.c_int
+
+# ── Vector quantization (db.h) ───────────────────────────────────────
+
+_lib.db_vec_quant_create.argtypes = [ctypes.c_void_p, ctypes.POINTER(_QuantParams)]
+_lib.db_vec_quant_create.restype = ctypes.c_int
+
+_lib.db_vec_quant_destroy.argtypes = [ctypes.c_void_p]
+_lib.db_vec_quant_destroy.restype = None
+
+_lib.db_vec_quant_train.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32]
+_lib.db_vec_quant_train.restype = ctypes.c_int
+
+_lib.db_vec_quant_insert.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+_lib.db_vec_quant_insert.restype = ctypes.c_int
+
+_lib.db_vec_quant_search.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.POINTER(_VecResult),
+]
+_lib.db_vec_quant_search.restype = ctypes.c_int
+
+_lib.db_vec_quant_decode.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_float)]
+_lib.db_vec_quant_decode.restype = ctypes.c_int
 
 
 # ── High-level Python API ────────────────────────────────────────────
@@ -327,9 +481,21 @@ class _ResultSet:
 
 
 class _QueryBuilder:
-    def __init__(self, db_ptr, table: str):
-        self._ptr = _lib.db_query(db_ptr, table.encode())
+    def __init__(self, db_ptr, table: str = None):
         self._db_ref = db_ptr
+        if table:
+            self._ptr = _lib.db_query(db_ptr, table.encode())
+        else:
+            self._ptr = None
+
+    def from_(self, table: str) -> "_QueryBuilder":
+        if not self._ptr:
+            self._ptr = _lib.db_query(self._db_ref, table.encode())
+            if not self._ptr:
+                raise KanbuDBError(KANBUDB_ERR_OOM, "failed to create query builder")
+            return self
+        _check(_lib.qb_from(self._ptr, table.encode()))
+        return self
 
     def filter(self, column: str, op: str, value) -> "_QueryBuilder":
         v = str(value).encode()
@@ -408,18 +574,92 @@ class Condition:
         )
 
 
+class _Reader:
+    """Multi-process read-only database handle.
+
+    Opens a database previously written by a writer process and
+    periodically polls the shared WAL for new data.
+    """
+
+    def __init__(self, path: str, *, poll_ms: int = 10):
+        cfg = self._make_config(poll_ms)
+        self._ptr = ctypes.c_void_p()
+        rc = _lib.db_open_reader(path.encode(), ctypes.byref(cfg), ctypes.byref(self._ptr))
+        if rc != KANBUDB_OK:
+            raise KanbuDBError(rc)
+        self._path = path
+
+    @staticmethod
+    def _make_config(poll_ms: int) -> _DbConfig:
+        cfg = _DbConfig()
+        cfg.fsync_mode = _FSYNC_NONE
+        cfg.cache_size = 65536
+        cfg.memtable_size = 65536
+        cfg.compaction_threads = 0
+        cfg.multi_process = 1
+        cfg.reader_poll_ms = poll_ms
+        return cfg
+
+    def refresh(self):
+        """Manually refresh the reader's view of the database."""
+        rc = _lib.db_reader_refresh(self._ptr)
+        if rc != KANBUDB_OK:
+            raise KanbuDBError(rc)
+
+    def get(self, table: str, key: str) -> Optional[bytes]:
+        val_ptr = ctypes.c_void_p()
+        val_len = ctypes.c_size_t()
+        rc = _lib.db_get(self._ptr, table.encode(), key.encode(), len(key),
+                         ctypes.byref(val_ptr), ctypes.byref(val_len))
+        if rc == KANBUDB_ERR_NOTFOUND:
+            return None
+        _check(rc)
+        return ctypes.string_at(val_ptr, val_len.value)
+
+    def close(self):
+        if self._ptr and self._ptr.value:
+            _lib.db_close(self._ptr)
+            self._ptr.value = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+
 class Database:
     """KanbuDB embedded database handle."""
 
     def __init__(self, path: str, *, fsync: str = "periodic",
-                 cache_size: int = 0, memtable_size: int = 4 * 1024 * 1024):
+                 cache_size: int = 0, memtable_size: int = 4 * 1024 * 1024,
+                 multi_process: bool = False):
         fsync_map = {"none": 0, "periodic": 1, "always": 2}
-        cfg = _DbConfig(fsync_map.get(fsync, 1), cache_size, memtable_size, 1)
+        cfg = self._make_config(fsync_map.get(fsync, 1), cache_size, memtable_size,
+                                multi_process)
         self._ptr = ctypes.c_void_p()
         rc = _lib.db_open(path.encode(), ctypes.byref(cfg), ctypes.byref(self._ptr))
         if rc != KANBUDB_OK:
             raise KanbuDBError(rc)
         self._table_schemas: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _make_config(fsync: int, cache_size: int, memtable_size: int,
+                     multi_process: bool = False) -> _DbConfig:
+        cfg = _DbConfig()
+        cfg.fsync_mode = fsync
+        cfg.cache_size = cache_size
+        cfg.memtable_size = memtable_size
+        cfg.compaction_threads = 1
+        cfg.multi_process = 1 if multi_process else 0
+        cfg.reader_poll_ms = 10
+        cfg.level0_file_num_compaction_trigger = 4
+        cfg.max_bytes_for_level_base = 10 * 1024 * 1024
+        cfg.max_bytes_for_level_multiplier = 10
+        return cfg
 
     # ── Schema ────────────────────────────────────────────────────
 
@@ -488,7 +728,7 @@ class Database:
 
     # ── Query ─────────────────────────────────────────────────────
 
-    def query(self, table: str) -> _QueryBuilder:
+    def query(self, table: str = None) -> _QueryBuilder:
         return _QueryBuilder(self._ptr, table)
 
     # ── Full-text search ──────────────────────────────────────────
@@ -512,10 +752,10 @@ class Database:
         rc = _lib.db_fts_drop_index(self._ptr, table.encode(), column.encode())
         _check(rc)
 
-    # ── Vector Index ──────────────────────────────────────────────
+    # ── Standalone Vector Index (idx_* methods operate on a raw vector index handle) ──
 
-    def vec_create(self, path: str, params: dict) -> int:
-        """Create a vector index.
+    def idx_create(self, path: str, params: dict) -> int:
+        """Create a standalone vector index.
 
         Args:
             path: File path for the index (or None for in-memory).
@@ -550,34 +790,79 @@ class Database:
         _check(rc)
         return out.value
 
-    def vec_open(self, path: str) -> int:
-        """Open an existing vector index from disk."""
+    def idx_open(self, path: str) -> int:
+        """Open an existing standalone vector index from disk."""
         out = ctypes.c_void_p()
         rc = _lib.kanbudb_vec_open(path.encode(), ctypes.byref(out))
         _check(rc)
         return out.value
 
-    def vec_close(self, idx: int):
-        """Close a vector index handle."""
+    def idx_close(self, idx: int):
+        """Close a standalone vector index handle."""
         _check(_lib.kanbudb_vec_close(ctypes.c_void_p(idx)))
 
-    def vec_insert(self, idx: int, vid: int, vector: list):
-        """Insert a vector into the index.
+    def idx_flush(self, idx: int):
+        """Flush a standalone vector index to disk."""
+        _check(_lib.kanbudb_vec_flush(ctypes.c_void_p(idx)))
+
+    def idx_flush_interval(self, idx: int, interval_ms: int):
+        """Set auto-flush interval for a standalone vector index."""
+        _check(_lib.kanbudb_vec_flush_interval(ctypes.c_void_p(idx), interval_ms))
+
+    def idx_destroy(self, path: str):
+        """Delete all standalone vector index files at path."""
+        _check(_lib.kanbudb_vec_destroy(path.encode()))
+
+    def idx_insert(self, idx: int, vid: int, vector: list):
+        """Insert a vector into a standalone index.
 
         Args:
-            idx: Index handle from vec_create/vec_open.
+            idx: Index handle from idx_create/idx_open.
             vid: Unique 64-bit ID for the vector.
             vector: List of floats (length must match dimension).
         """
         arr = (ctypes.c_float * len(vector))(*vector)
         _check(_lib.kanbudb_vec_insert(ctypes.c_void_p(idx), ctypes.c_uint64(vid), arr))
 
-    def vec_delete(self, idx: int, vid: int):
-        """Delete a vector by ID."""
+    def idx_insert_batch(self, idx: int, ids: list, vectors: list):
+        """Insert multiple vectors in one call into a standalone index.
+
+        Args:
+            idx: Index handle.
+            ids: List of uint64 IDs (length N).
+            vectors: List of N lists, each with dimension floats.
+        """
+        n = len(ids)
+        id_arr = (ctypes.c_uint64 * n)(*ids)
+        flat = []
+        for v in vectors:
+            flat.extend(v)
+        vec_arr = (ctypes.c_float * len(flat))(*flat)
+        _check(_lib.kanbudb_vec_insert_batch(
+            ctypes.c_void_p(idx), ctypes.c_uint32(n), id_arr, vec_arr
+        ))
+
+    def idx_delete(self, idx: int, vid: int):
+        """Delete a vector by ID from a standalone index."""
         _check(_lib.kanbudb_vec_delete(ctypes.c_void_p(idx), ctypes.c_uint64(vid)))
 
-    def vec_search(self, idx: int, query: list, k: int = 10):
-        """Search for nearest neighbors.
+    def idx_get(self, idx: int, vid: int, dim: int) -> list:
+        """Retrieve a raw vector by ID from a standalone index.
+
+        Args:
+            idx: Index handle.
+            vid: Vector ID.
+            dim: Expected dimension.
+
+        Returns:
+            List of floats.
+        """
+        out = (ctypes.c_float * dim)()
+        _check(_lib.kanbudb_vec_get(ctypes.c_void_p(idx), ctypes.c_uint64(vid), out))
+        return list(out)
+
+    def idx_search(self, idx: int, query: list, k: int = 10):
+        """Search a standalone index for nearest neighbors.
 
         Args:
             idx: Index handle.
@@ -594,13 +879,50 @@ class Database:
             raise KanbuDBError(n)
         return [(results[i].id, results[i].distance) for i in range(n)]
 
-    def vec_count(self, idx: int) -> int:
-        """Return the number of vectors in the index."""
+    def idx_search_radius(self, idx: int, query: list, radius: float, max_results: int = 100):
+        """Search a standalone index within a radius.
+
+        Args:
+            idx: Index handle.
+            query: List of floats (query vector).
+            radius: Maximum distance.
+            max_results: Max results to return.
+
+        Returns:
+            List of (id, distance) tuples within the radius.
+        """
+        qarr = (ctypes.c_float * len(query))(*query)
+        results = (_VecResult * max_results)()
+        n = _lib.kanbudb_vec_search_radius(
+            ctypes.c_void_p(idx), qarr, ctypes.c_float(radius), results,
+            ctypes.c_uint32(max_results),
+        )
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
+
+    def idx_count(self, idx: int) -> int:
+        """Return the number of vectors in a standalone index."""
         return _lib.kanbudb_vec_count(ctypes.c_void_p(idx))
 
-    def vec_dimension(self, idx: int) -> int:
-        """Return the dimension of vectors in the index."""
+    def idx_dimension(self, idx: int) -> int:
+        """Return the dimension of vectors in a standalone index."""
         return _lib.kanbudb_vec_dimension(ctypes.c_void_p(idx))
+
+    def idx_stats(self, idx: int) -> dict:
+        """Return statistics about a standalone vector index.
+
+        Returns:
+            dict with keys: count, capacity, memory_bytes, dimension.
+        """
+        stats = _VecStats()
+        _check(_lib.kanbudb_vec_stats(ctypes.c_void_p(idx), ctypes.byref(stats)))
+        return {
+            "count": stats.count,
+            "capacity": stats.capacity,
+            "memory_bytes": stats.memory_bytes,
+            "dimension": stats.dimension,
+        }
 
     # ── DB-level Vector (auto-embedding) ─────────────────────────
 
@@ -641,6 +963,30 @@ class Database:
         rc = _lib.db_vec_insert_text(self._ptr, ctypes.c_uint64(vid), encoded, len(encoded))
         _check(rc)
 
+    def vec_insert_batch(self, ids: list, texts: list):
+        """Insert multiple text strings in one call (auto-embeds).
+
+        Args:
+            ids: List of uint64 IDs (length N).
+            texts: List of N text strings.
+        """
+        n = len(ids)
+        id_arr = (ctypes.c_uint64 * n)(*ids)
+        txt_arr = (ctypes.c_char_p * n)()
+        len_arr = (ctypes.c_size_t * n)()
+        for i, t in enumerate(texts):
+            encoded = t.encode("utf-8")
+            txt_arr[i] = encoded
+            len_arr[i] = len(encoded)
+        _check(_lib.db_vec_insert_batch(
+            self._ptr, ctypes.c_uint32(n), id_arr, txt_arr, len_arr,
+        ))
+
+    def vec_insert_vector(self, vid: int, vector: list):
+        """Insert a raw vector into the DB-level index."""
+        arr = (ctypes.c_float * len(vector))(*vector)
+        _check(_lib.db_vec_insert_vector(self._ptr, ctypes.c_uint64(vid), arr))
+
     def vec_search_text(self, query: str, k: int = 10):
         """Search by text query (auto-embeds and searches).
 
@@ -656,10 +1002,22 @@ class Database:
             raise KanbuDBError(n)
         return [(results[i].id, results[i].distance) for i in range(n)]
 
-    def vec_insert_vector(self, vid: int, vector: list):
-        """Insert a raw vector into the DB-level index."""
-        arr = (ctypes.c_float * len(vector))(*vector)
-        _check(_lib.db_vec_insert_vector(self._ptr, ctypes.c_uint64(vid), arr))
+    def vec_search(self, query: list, k: int = 10):
+        """Search by raw vector.
+
+        Args:
+            query: List of floats (query vector).
+            k: Number of nearest neighbors to return.
+
+        Returns:
+            List of (id, distance) tuples.
+        """
+        qarr = (ctypes.c_float * len(query))(*query)
+        results = (_VecResult * k)()
+        n = _lib.db_vec_search(self._ptr, qarr, ctypes.c_uint32(k), results)
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
 
     def vec_delete_by_id(self, vid: int):
         """Delete a vector from the DB-level index."""
@@ -668,6 +1026,190 @@ class Database:
     def vec_count(self) -> int:
         """Return count of vectors in the DB-level index."""
         return _lib.db_vec_count(self._ptr)
+
+    def vec_flush(self):
+        """Flush the DB-level vector index to disk."""
+        _check(_lib.db_vec_flush(self._ptr))
+
+    def vec_set_embed(self, embed: "Embedding"):
+        """Set a custom embedding engine for the DB-level vector index."""
+        _check(_lib.db_vec_set_embed(self._ptr, embed._ptr))
+
+    # ── Filtered Vector Search ───────────────────────────────────
+
+    def vec_search_filtered(self, query: list, k: int,
+                            filter_fn: Callable[[int], bool]):
+        """Search with a custom filter callback.
+
+        Args:
+            query: Query vector as list of floats.
+            k: Number of nearest neighbors.
+            filter_fn: Callable(id) -> bool, returns True for eligible IDs.
+
+        Returns:
+            List of (id, distance) tuples.
+        """
+        cb = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p)(
+            lambda id_val, _: 1 if filter_fn(id_val) else 0
+        )
+        qarr = (ctypes.c_float * len(query))(*query)
+        results = (_VecResult * k)()
+        n = _lib.db_vec_search_filtered(
+            self._ptr, qarr, ctypes.c_uint32(k),
+            cb, None, results,
+        )
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
+
+    def vec_search_text_filtered(self, query: str, k: int,
+                                  filter_fn: Callable[[int], bool]):
+        """Search by text with a custom filter callback.
+
+        Args:
+            query: Text query string.
+            k: Number of nearest neighbors.
+            filter_fn: Callable(id) -> bool, returns True for eligible IDs.
+
+        Returns:
+            List of (id, distance) tuples.
+        """
+        cb = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p)(
+            lambda id_val, _: 1 if filter_fn(id_val) else 0
+        )
+        encoded = query.encode("utf-8")
+        results = (_VecResult * k)()
+        n = _lib.db_vec_search_text_filtered(
+            self._ptr, encoded, len(encoded), ctypes.c_uint32(k),
+            cb, None, results,
+        )
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
+
+    # ── Hybrid Search ────────────────────────────────────────────
+
+    def hybrid_search(self, table: str, column: str, fts_query: str,
+                      vec_query: list, *, k: int = 10,
+                      vec_weight: float = 0.5, fts_weight: float = 0.5,
+                      mode: int = HYBRID_MODE_RRF):
+        """Hybrid vector + FTS search.
+
+        Args:
+            table: Table name.
+            column: Column name for FTS index.
+            fts_query: Full-text query string.
+            vec_query: Query vector as list of floats.
+            k: Number of results.
+            vec_weight: Vector search weight (mode=WEIGHTED only).
+            fts_weight: FTS search weight (mode=WEIGHTED only).
+            mode: HYBRID_MODE_RRF or HYBRID_MODE_WEIGHTED.
+
+        Returns:
+            List of dicts with keys: id, score, vec_distance, fts_score.
+        """
+        params = _HybridParams(
+            mode=mode,
+            vec_weight=vec_weight,
+            fts_weight=fts_weight,
+            k=k,
+        )
+        results = (_HybridResult * k)()
+        qarr = (ctypes.c_float * len(vec_query))(*vec_query)
+        n = _lib.db_hybrid_search(
+            self._ptr, table.encode(), column.encode(),
+            fts_query.encode(), qarr,
+            ctypes.byref(params), results, k,
+        )
+        if n < 0:
+            raise KanbuDBError(n)
+        return [
+            {
+                "id": results[i].id,
+                "score": results[i].score,
+                "vec_distance": results[i].vec_distance,
+                "fts_score": results[i].fts_score,
+            }
+            for i in range(n)
+        ]
+
+    # ── Vector Quantization ──────────────────────────────────────
+
+    def vec_quant_create(self, qtype: int = QUANT_PQ, dimension: int = 128,
+                         pq_subspaces: int = 4):
+        """Create a quantizer for the DB-level vector index.
+
+        Args:
+            qtype: QUANT_NONE, QUANT_SQ8, or QUANT_PQ.
+            dimension: Vector dimension.
+            pq_subspaces: Number of subspaces for PQ (default 4).
+        """
+        params = _QuantParams(type=qtype, dimension=dimension, pq_subspaces=pq_subspaces)
+        _check(_lib.db_vec_quant_create(self._ptr, ctypes.byref(params)))
+
+    def vec_quant_destroy(self):
+        """Destroy the quantizer."""
+        _lib.db_vec_quant_destroy(self._ptr)
+
+    def vec_quant_train(self, vectors: list):
+        """Train the quantizer on a set of vectors.
+
+        Args:
+            vectors: List of N lists, each with dimension floats.
+        """
+        n = len(vectors)
+        flat = []
+        for v in vectors:
+            flat.extend(v)
+        vec_arr = (ctypes.c_float * len(flat))(*flat)
+        _check(_lib.db_vec_quant_train(self._ptr, vec_arr, ctypes.c_uint32(n)))
+
+    def vec_quant_insert(self, vid: int, vector: list):
+        """Insert a quantized vector.
+
+        Args:
+            vid: Unique 64-bit ID.
+            vector: Raw vector as list of floats.
+        """
+        arr = (ctypes.c_float * len(vector))(*vector)
+        _check(_lib.db_vec_quant_insert(self._ptr, ctypes.c_uint64(vid), arr))
+
+    def vec_quant_search(self, query: list, k: int = 10):
+        """Search using quantized vectors.
+
+        Args:
+            query: Query vector as list of floats.
+            k: Number of nearest neighbors.
+
+        Returns:
+            List of (id, distance) tuples.
+        """
+        qarr = (ctypes.c_float * len(query))(*query)
+        results = (_VecResult * k)()
+        n = _lib.db_vec_quant_search(self._ptr, qarr, ctypes.c_uint32(k), results)
+        if n < 0:
+            raise KanbuDBError(n)
+        return [(results[i].id, results[i].distance) for i in range(n)]
+
+    def vec_quant_decode(self, vid: int, dimension: int) -> list:
+        """Decode a quantized vector back to float.
+
+        Args:
+            vid: Vector ID.
+            dimension: Expected dimension.
+
+        Returns:
+            List of floats (approximate reconstruction).
+        """
+        out = (ctypes.c_float * dimension)()
+        _check(_lib.db_vec_quant_decode(self._ptr, ctypes.c_uint64(vid), out))
+        return list(out)
+
+    # ── Error info ──────────────────────────────────────────────
+
+    def last_error(self) -> int:
+        """Return the last error code."""
+        return _lib.db_last_error(self._ptr)
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -701,6 +1243,19 @@ def open(path: str, **kw) -> Database:
     return Database(path, **kw)
 
 
+def open_reader(path: str, *, poll_ms: int = 10) -> _Reader:
+    """Open a multi-process read-only reader.
+
+    Args:
+        path: Database path (same as writer's path).
+        poll_ms: WAL polling interval in milliseconds (default 10).
+
+    Returns:
+        _Reader instance.
+    """
+    return _Reader(path, poll_ms=poll_ms)
+
+
 class Embedding:
     """Standalone text embedding using KanbuDB's built-in n-gram hash + random projection."""
 
@@ -716,17 +1271,41 @@ class Embedding:
 
     @property
     def dimension(self) -> int:
-        return self._dim
+        return _lib.kanbudb_embed_dimensions(self._ptr)
 
     def embed(self, text: str) -> list[float]:
         """Embed text into a float vector."""
         encoded = text.encode("utf-8")
         vec = (ctypes.c_float * self._dim)()
-        rc = _lib.kanbudb_embed_text(
-            self._ptr, encoded, len(encoded), vec
-        )
+        rc = _lib.kanbudb_embed_text(self._ptr, encoded, len(encoded), vec)
         _check(rc)
         return list(vec)
+
+    def embed_batch(self, texts: list) -> list[list[float]]:
+        """Embed multiple texts in one call.
+
+        Args:
+            texts: List of text strings.
+
+        Returns:
+            List of float vectors.
+        """
+        n = len(texts)
+        txt_arr = (ctypes.c_char_p * n)()
+        len_arr = (ctypes.c_size_t * n)()
+        for i, t in enumerate(texts):
+            encoded = t.encode("utf-8")
+            txt_arr[i] = encoded
+            len_arr[i] = len(encoded)
+        out = (ctypes.c_float * (n * self._dim))()
+        _check(_lib.kanbudb_embed_batch(
+            self._ptr, txt_arr, len_arr, ctypes.c_uint32(n), out,
+        ))
+        result = []
+        for i in range(n):
+            start = i * self._dim
+            result.append(list(out[start:start + self._dim]))
+        return result
 
     def close(self):
         if self._ptr and self._ptr.value:

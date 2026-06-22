@@ -35,7 +35,16 @@ typedef struct {
     char**   file_paths;     /* full paths to SSTable files at this level */
     int      num_files;
     uint64_t total_size;     /* sum of file sizes */
-} kanbudb_level_t;
+} compaction_level_t;
+
+/* Backward-compatible alias */
+#define kanbudb_level_t compaction_level_t
+
+/* Compaction manager — groups all compaction state */
+typedef struct {
+    compaction_level_t levels[KANBUDB_MAX_LEVELS];
+    uint64_t max_bytes[KANBUDB_MAX_LEVELS];
+} compaction_manager_t;
 
 /* ── Level management ───────────────────────────────────── */
 
@@ -52,7 +61,12 @@ void compaction_free_levels(kanbudb_level_t* levels, int max_levels);
 
 /* Check if compaction is needed. Returns the source level to compact
  * (0..max_levels-2), or -1 if no compaction needed. */
-int compaction_pick_level(const kanbudb_level_t* levels, int max_levels);
+int compaction_pick_level(const compaction_level_t* levels, int max_levels);
+
+/* Alias for plan compatibility */
+static inline int compaction_pick(const compaction_level_t* levels, int max_levels) {
+    return compaction_pick_level(levels, max_levels);
+}
 
 /* ── Compaction executor ────────────────────────────────── */
 
@@ -63,6 +77,14 @@ int compaction_pick_level(const kanbudb_level_t* levels, int max_levels);
 int compaction_merge_to_level(const char** input_paths, int num_inputs,
                               const char* output_path,
                               uint64_t output_sequence);
+
+/* Run compaction for a full level: scan, pick if needed, merge, clean up.
+ * Uses db_path for file paths. Returns KANBUDB_OK on success. */
+int compaction_run_level(const char* db_path, int level, uint64_t output_sequence);
+
+/* Register a new file into the level tracking after flush. */
+void compaction_register_file(compaction_manager_t* mgr, int level,
+                              const char* path, uint64_t file_size);
 
 /* ── Legacy compactor API (backwards compat) ───────────── */
 typedef struct kanbudb_compactor kanbudb_compactor_t;

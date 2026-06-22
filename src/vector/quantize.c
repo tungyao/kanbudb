@@ -238,11 +238,14 @@ static float pq_distance_scalar(const kanbudb_quantizer_t* q,
     return sum;
 }
 
-/* ── PQ distance: AVX2 (8-wide) ───────────────────────── */
+/* ── PQ distance: SIMD (function-specific targets) ────── */
+/* Uses __attribute__((target(...))) for runtime dispatch,
+ * no compile-time -mavx2/-mavx512f flags needed. */
 
-#ifdef __AVX2__
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 
+__attribute__((target("avx2,fma")))
 static float pq_distance_avx2(const kanbudb_quantizer_t* q,
                                const uint8_t* a, const uint8_t* b)
 {
@@ -269,7 +272,6 @@ static float pq_distance_avx2(const kanbudb_quantizer_t* q,
         }
     }
 
-    /* Horizontal sum of the 8-wide accumulator */
     __m128 hi = _mm256_extractf128_ps(sum, 1);
     __m128 lo = _mm256_castps256_ps128(sum);
     __m128 s = _mm_add_ps(lo, hi);
@@ -277,12 +279,52 @@ static float pq_distance_avx2(const kanbudb_quantizer_t* q,
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s) + tail;
 }
+
+__attribute__((target("avx512f")))
+static float pq_distance_avx512(const kanbudb_quantizer_t* q,
+                                 const uint8_t* a, const uint8_t* b)
+{
+    uint32_t nsub = q->params.pq_subspaces;
+    uint32_t sub_dim = q->pq_sub_dim;
+    uint32_t vec_loops = sub_dim / 16;
+    uint32_t tail_start = vec_loops * 16;
+    __m512 sum = _mm512_setzero_ps();
+    float tail = 0.0f;
+
+    for (uint32_t s = 0; s < nsub; s++) {
+        const float* ca = q->pq_codebooks[s] + a[s] * sub_dim;
+        const float* cb = q->pq_codebooks[s] + b[s] * sub_dim;
+
+        for (uint32_t d = 0; d < vec_loops * 16; d += 16) {
+            __m512 va = _mm512_loadu_ps(ca + d);
+            __m512 vb = _mm512_loadu_ps(cb + d);
+            __m512 diff = _mm512_sub_ps(va, vb);
+            sum = _mm512_fmadd_ps(diff, diff, sum);
+        }
+        for (uint32_t d = tail_start; d < sub_dim; d++) {
+            float diff = ca[d] - cb[d];
+            tail += diff * diff;
+        }
+    }
+
+    __m128 hi = _mm512_extractf32x4_ps(sum, 1);
+    __m128 lo = _mm512_castps512_ps128(sum);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s) + tail;
+}
+
 #else
 static float pq_distance_avx2(const kanbudb_quantizer_t* q,
-                               const uint8_t* a, const uint8_t* b)
-{
+                               const uint8_t* a, const uint8_t* b) {
     (void)q; (void)a; (void)b;
-    return pq_distance_scalar(q, a, b); /* fallback when AVX2 not compiled */
+    return pq_distance_scalar(q, a, b);
+}
+static float pq_distance_avx512(const kanbudb_quantizer_t* q,
+                                 const uint8_t* a, const uint8_t* b) {
+    (void)q; (void)a; (void)b;
+    return pq_distance_scalar(q, a, b);
 }
 #endif
 
@@ -292,12 +334,16 @@ static float pq_distance(const kanbudb_quantizer_t* q,
                           const uint8_t* a, const uint8_t* b)
 {
 #if defined(__x86_64__) || defined(__i386__)
-    /* Runtime CPU feature detection — no compile-time #ifdef needed */
-    static int avx2_checked = 0;
+    static int checked = 0;
+    static int use_avx512 = 0;
     static int use_avx2 = 0;
-    if (!avx2_checked) {
-        avx2_checked = 1;
+    if (!checked) {
+        checked = 1;
+        use_avx512 = __builtin_cpu_supports("avx512f");
         use_avx2 = __builtin_cpu_supports("avx2");
+    }
+    if (use_avx512) {
+        return pq_distance_avx512(q, a, b);
     }
     if (use_avx2) {
         return pq_distance_avx2(q, a, b);

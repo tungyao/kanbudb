@@ -168,7 +168,13 @@ kanbudb_wal_t* wal_create(const char* path, int fsync_mode)
   /* Try io_uring init — fall back to stdio on failure */
   wal->use_io_uring = 0;
   memset(&wal->ring, 0, sizeof(wal->ring));
-  int uring_ret = io_uring_queue_init(32, &wal->ring, 0);
+  unsigned uring_flags = 0;
+#ifdef IORING_SETUP_COOP_TASKRUN
+  uring_flags |= IORING_SETUP_COOP_TASKRUN;
+#endif
+  /* Note: IORING_SETUP_SINGLE_ISSUER not used — db_put can be called
+   * from multiple threads concurrently, which violates its requirement. */
+  int uring_ret = io_uring_queue_init(32, &wal->ring, uring_flags);
   if (uring_ret == 0) {
     wal->use_io_uring = 1;
   }
