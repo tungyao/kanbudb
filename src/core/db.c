@@ -309,7 +309,7 @@ int db_reader_refresh(db_t* db) {
     char wal_path_mmap[512];
     snprintf(wal_path_mmap, sizeof(wal_path_mmap), "%s.wal.mmap", internal->path);
     size_t wal_data_cap = 64 * 1024 * 1024;  /* 64MB */
-    int mrc = wal_mmap_open(wal_path_mmap, 0, wal_data_cap, &internal->wal_mmap);
+    int mrc = wal_mmap_open(wal_path_mmap, 1, wal_data_cap, &internal->wal_mmap);
     if (mrc < 0) {
       internal->wal_mmap.region.addr = NULL;
       return KANBUDB_ERR_IO;
@@ -430,7 +430,7 @@ int db_open_reader(const char* path, const db_config_t* config, db_t** out) {
     char wal_path_mmap[512];
     snprintf(wal_path_mmap, sizeof(wal_path_mmap), "%s.wal.mmap", path);
     size_t wal_data_cap = 64 * 1024 * 1024;  /* 64MB */
-    int mrc = wal_mmap_open(wal_path_mmap, 0, wal_data_cap, &db->wal_mmap);
+    int mrc = wal_mmap_open(wal_path_mmap, 1, wal_data_cap, &db->wal_mmap);
     if (mrc < 0) {
       /* Non-fatal: reader can still read SSTables */
     }

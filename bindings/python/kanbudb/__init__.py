@@ -726,6 +726,17 @@ class Database:
         _check(rc)
         return True
 
+    def reader_refresh(self):
+        """Refresh the database view from the shared WAL.
+        
+        In multi-process mode, other processes may have written new
+        entries to the WAL. This method replays those entries into
+        the local B-tree so that subsequent reads see the latest data.
+        """
+        rc = _lib.db_reader_refresh(self._ptr)
+        if rc != KANBUDB_OK:
+            raise KanbuDBError(rc)
+
     # ── Query ─────────────────────────────────────────────────────
 
     def query(self, table: str = None) -> _QueryBuilder:
