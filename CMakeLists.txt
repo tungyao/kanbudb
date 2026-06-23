@@ -31,6 +31,7 @@ set(KANBUDB_SOURCES
   src/vector/persistence.c
   src/vector/hnsw.c
   src/vector/embedding.c
+  src/vector/dict_data.c
   src/vector/quantize.c
   src/vector/vec_filter.c
   src/hybrid/hybrid.c
